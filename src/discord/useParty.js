@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-// Клиент комнаты. Сервер — единственный источник правды: рассылает полный
-// снимок состояния после каждого события, клиент только рисует.
-// Приватные данные (проверки букв, шепот) приходят отдельными сообщениями
-// и в общий снапшот не попадают.
 export function useParty(me) {
   const wsRef = useRef(null);
   const [state, setState] = useState(null);
   const [connected, setConnected] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [reactions, setReactions] = useState([]);
-  const [privateData, setPrivateData] = useState({ hints: [], whispers: [] });
+  const [privateData, setPrivateData] = useState({ myRows: [], hints: [], peeks: [] });
+  const [left, setLeft] = useState(false); // вышел из комнаты в меню
+  const [roomList, setRoomList] = useState([]);
+  const [inRoom, setInRoom] = useState(false); // мы внутри какой-то комнаты
 
   const pushToast = useCallback((text) => {
     const id = Math.random().toString(36).slice(2);
@@ -30,17 +29,32 @@ export function useParty(me) {
     };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.t === 'state') setState(msg.state);
-      else if (msg.t === 'toast') pushToast(msg.text);
-      else if (msg.t === 'private') {
-        setPrivateData((prev) => ({
-          hints: msg.data.hints ?? prev.hints,
-          whispers: msg.data.whispers ?? prev.whispers,
-        }));
-      } else if (msg.t === 'react') {
+      if (msg.t === 'state') {
+        setState(msg.state);
+        setInRoom(Boolean(msg.state.roomId));
+      }
+      if (msg.t === 'roomList') setRoomList(msg.rooms || []);
+      if (msg.t === 'toast') pushToast(msg.text);
+      if (msg.t === 'react') {
         const id = Math.random().toString(36).slice(2);
-        setReactions((r) => [...r, { id, emoji: msg.emoji, left: 10 + Math.random() * 70 }]);
-        setTimeout(() => setReactions((r) => r.filter((x) => x.id !== id)), 2600);
+        const left = 15 + Math.floor(Math.random() * 70);
+        setReactions((r) => [...r, { id, emoji: msg.emoji, from: msg.from, left }]);
+        setTimeout(() => setReactions((r) => r.filter((x) => x.id !== id)), 2500);
+      }
+      if (msg.t === 'private') {
+        // переподключение в комнату по hello (refresh страницы)
+        if (msg.data.rejoined) setInRoom(true);
+        // подсмотренные слова (перк «Прошлые надои») — копятся карточками
+        if (msg.data.peek) {
+          setPrivateData((prev) => ({ ...prev, peeks: [...(prev.peeks || []), msg.data.peek] }));
+        }
+        if (msg.data.myRows || msg.data.hints) {
+          setPrivateData((prev) => ({
+            ...prev,
+            myRows: msg.data.myRows ?? prev.myRows,
+            hints: msg.data.hints ?? prev.hints,
+          }));
+        }
       }
     };
     ws.onclose = () => setConnected(false);
@@ -53,24 +67,46 @@ export function useParty(me) {
   }, []);
 
   const actions = {
+    createRoom: (name, visibility, isPrivate = false) =>
+      send({ t: 'createRoom', name, visibility, isPrivate, playerName: me?.name, avatar: me?.avatar }),
+    deleteRoom: () => {
+      setState(null);
+      setInRoom(false);
+      setPrivateData({ myRows: [], hints: [], peeks: [] });
+      send({ t: 'deleteRoom' });
+    },
+    joinRoom: (roomId) => send({ t: 'joinRoom', roomId, playerName: me?.name, avatar: me?.avatar }),
+    leaveRoom: () => send({ t: 'leaveRoom' }),
     start: () => send({ t: 'start' }),
     setPoints: (pointsToWin) => send({ t: 'settings', pointsToWin }),
-    setTheme: (theme) => send({ t: 'settings', theme }),
-    setTeamMode: (teamMode) => send({ t: 'settings', teamMode }),
+    setLang: (lang) => send({ t: 'settings', lang }),
+    setWordLength: (wordLength) => send({ t: 'settings', wordLength }),
+    setVisibility: (visibility) => send({ t: 'settings', visibility }),
+    setTickSeconds: (tickSeconds) => send({ t: 'settings', tickSeconds }),
+    setEventsEnabled: (eventsEnabled) => send({ t: 'settings', eventsEnabled }),
+    addBot: (difficulty = 'normal') => send({ t: 'addBot', difficulty }),
+    setBotDifficulty: (botId, difficulty) => send({ t: 'setBotDifficulty', botId, difficulty }),
+    removeBot: (botId) => send({ t: 'removeBot', botId }),
     guess: (word) => send({ t: 'guess', word }),
-    next: () => send({ t: 'next' }),
     ready: () => send({ t: 'ready' }),
+    endMatch: () => send({ t: 'endMatch' }),
     rematch: () => send({ t: 'rematch' }),
     react: (emoji) => send({ t: 'react', emoji }),
-    drawPick: (side) => send({ t: 'drawPick', side }),
-    smkPick: (sym) => send({ t: 'smkPick', sym }),
-    pickPos: (pos) => send({ t: 'pickPos', pos }),
     power: (kind, extra = {}) => send({ t: 'power', kind, ...extra }),
+    // выход в меню: сервер сам разрулит хоста и тик; сокет оставляем жить,
+    // чтобы снова создавать/искать комнаты без переподключения
+    leave: () => {
+      setLeft(true);
+      setInRoom(false);
+      setState(null);
+      setPrivateData({ myRows: [], hints: [], peeks: [] });
+      send({ t: 'leaveRoom' });
+    },
   };
 
   const clearPrivate = useCallback(() => {
-    setPrivateData({ hints: [], whispers: [] });
+    setPrivateData({ myRows: [], hints: [], peeks: [] });
   }, []);
 
-  return { state, connected, toasts, reactions, privateData, clearPrivate, pushToast, actions };
+  return { state, connected, left, roomList, inRoom, toasts, reactions, privateData, clearPrivate, pushToast, actions };
 }

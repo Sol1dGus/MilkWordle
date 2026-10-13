@@ -7,38 +7,41 @@ import Toast from './Toast.jsx';
 import { Tile } from './Board.jsx';
 import { line } from '../game/lines.js';
 import { sfx } from '../game/sfx.js';
-import { keyboardMarks, normalizeWord } from '../game/logic.js';
-import { THEMES } from '../game/words.js';
+import { keyboardMarks, LANGS, normalizeWord } from '../game/logic.js';
 
 const MARK_EMOJI = { correct: '🟫', present: '🟨', absent: '⬜' };
-const POINT_OPTIONS = [1, 3, 5, 10];
-const ACH_ICONS = { smkKing: '🧀', stakhanovets: '🥛', iceHeart: '🧊' };
-const ACH_TITLES = {
-  smkKing: 'Сырный король — выиграл 3 молочные битвы',
-  stakhanovets: 'Дояр-стахановец — 5 побед подряд',
-  iceHeart: 'Ледяное сердце — заморозил будущего чемпиона',
+const POINT_OPTIONS = [32, 48, 64, 96];
+const TICK_OPTIONS = [
+  { sec: 15, label: '15с' },
+  { sec: 30, label: '30с' },
+  { sec: 45, label: '45с' },
+];
+const BOT_DIFFS = {
+  easy: { next: 'normal', label: '🌱 Телёнок', icon: '🌱', title: 'Лёгкий ИИ: часто ошибается, не тратит талоны (нажми для смены)' },
+  normal: { next: 'hard', label: '🥛 Дояр', icon: '🥛', title: 'Средний ИИ: сужает словарь, иногда берёт сливки (нажми для смены)' },
+  hard: { next: 'easy', label: '🔥 Кибер-корова', icon: '🔥', title: 'Сложный ИИ: почти не ошибается и кидает перехваты в лидера! (нажми для смены)' },
 };
 
-// текст результата для буфера обмена: доска эмодзи + заголовок
-function buildResultText(state) {
+const fmtPts = (x) => (Number.isFinite(Number(x)) ? String(Math.round(Number(x) * 100) / 100) : '—');
+
+// текст результата для буфера обмена: своя доска эмодзи + заголовок
+function buildResultText(state, myRows) {
   const r = state.round;
   if (!r) return '';
-  const winner = state.players.find((p) => p.id === r.winnerId)?.name || 'кто-то';
-  const lines = [`🥛 МОЛОКО — ${r.word?.toUpperCase()} за ${r.board.length} (${winner})`];
-  if (state.settings.teamMode) lines.push(`🥚 ${state.teamPoints?.egg ?? 0} : ${state.teamPoints?.hen ?? 0} 🐔`);
-  for (const row of r.board) {
+  const winners = r.winners.map((id) => state.players.find((p) => p.id === id)?.name).filter(Boolean);
+  const lines = [`🥛 МОЛОКО — ${r.word?.toUpperCase()} (тик ${r.tick})`];
+  lines.push(winners.length ? `🏆 ${winners.join(' + ')}` : '😐 никто не угадал');
+  for (const row of myRows) {
     lines.push([...row.marks].map((m) => MARK_EMOJI[m]).join(''));
   }
   return lines.join('\n');
 }
 
-async function copyResult(state, pushToast) {
-  const text = buildResultText(state);
+async function copyResult(text, pushToast) {
   try {
     await navigator.clipboard.writeText(text);
     pushToast('Скопировано — кидай в чат!');
   } catch {
-    // Discord-iframe может резать clipboard API — запасной путь
     const ta = document.createElement('textarea');
     ta.value = text;
     document.body.appendChild(ta);
@@ -52,47 +55,103 @@ async function copyResult(state, pushToast) {
     ta.remove();
   }
 }
-const REACTIONS = ['🐮', '🥛', '👏', '😏', '🔥'];
-const LETTERS = [...'абвгдежзийклмнопрстуфхцчшщъыьэюя'];
-const SMK = [
-  { sym: 'cheese', label: '🧀 Сыр' },
-  { sym: 'milk', label: '🥛 Молоко' },
-  { sym: 'jug', label: '🫗 Кувшин' },
-];
 
 function Avatar({ player, size = 34 }) {
   return player?.avatar ? (
     <img className="avatar" src={player.avatar} alt="" width={size} height={size} />
   ) : (
     <span className="avatar cow-fallback" style={{ width: size, height: size }} aria-hidden>
-      🐮
+      {player?.isBot ? '🤖' : '🐮'}
     </span>
   );
 }
 
-// ушедшие игроки из списков убираются (очки сохраняются на случай реванша)
-const alive = (state) => state.players.filter((p) => p.connected);
-
-function Scoreboard({ state, meId }) {
-  const sorted = alive(state).sort((a, b) => b.points - a.points);
-  const teamMode = state.settings.teamMode;
+// мини-доска противника: в закрытом режиме только цвета, в открытом или в конце раунда — буквы
+function MiniBoard({ marks, maxRows, cols, lettered, revealedWords }) {
   return (
-    <div className="scoreboard">
-      {sorted.map((p) => {
-        const isSpec = state.round && !state.round.order.includes(p.id);
+    <div className="mini-board">
+      {Array.from({ length: maxRows }).map((_, ri) => (
+        <div className="mini-row" key={ri}>
+          {Array.from({ length: cols }).map((_, ci) => {
+            const row = marks[ri];
+            const m = row ? row.marks[ci] : null;
+            const ch = (lettered && row?.w ? row.w[ci] : '') || (revealedWords?.[ri]?.[ci] ?? '');
+            return (
+              <span key={ci} className={`mini-tile ${m ? `s-${m}` : ''} ${row?.old ? 'old' : ''}`}>
+                {ch}
+              </span>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// левая колонка: все игроки (включая себя), отсортированные по очкам
+function PlayerList({ state, meId, myRows, maxAttempts, wordLen }) {
+  const r = state.round;
+  const lettered = state.settings.visibility === 'open';
+  const sortedPlayers = [...state.players]
+    .filter((p) => p.connected)
+    .sort((a, b) => b.points - a.points);
+  const topPts = sortedPlayers[0]?.points ?? 0;
+
+  return (
+    <div className="player-list">
+      {sortedPlayers.map((p, idx) => {
+        const isMe = p.id === meId;
+        const rows = isMe && myRows?.length ? myRows : r?.boards[p.id] || [];
+        const revealed = r?.revealedWords?.[p.id] || null;
+        const isSpec = r && !r.boards[p.id];
+        const submitted = r?.submittedIds.includes(p.id);
+        const done = r?.doneIds.includes(p.id);
+        const won = r?.winners.includes(p.id);
+        const isLeader = topPts > 0 && p.points === topPts;
+        const status = won
+          ? '🏆'
+          : done
+            ? '—'
+            : isSpec
+              ? '👀'
+              : submitted
+                ? '✓'
+                : '…';
+        const botDiff = p.isBot ? BOT_DIFFS[p.difficulty || 'normal'] : null;
         return (
           <div
             key={p.id}
-            className={`chip ${p.id === state.round?.turnId ? 'turn' : ''} ${p.id === meId ? 'me' : ''}`}
+            className={`player-card ${isMe ? 'me' : ''} ${isLeader ? 'leader' : ''}`}
           >
-            <Avatar player={p} />
-            {teamMode && p.team && <span>{p.team === 'egg' ? '🥚' : '🐔'}</span>}
-            <span className="chip-name">{p.name}</span>
-            {isSpec && <span className="spec-tag">набл.</span>}
-            {p.tokens > 0 && !isSpec && <span className="chip-tokens">🪙{p.tokens}</span>}
-            <span className="chip-pts">
-              {teamMode ? (state.teamPoints?.[p.team] ?? 0) : `${p.points}/${maxPtsOf(state)}`}
-            </span>
+            <div className="player-head">
+              <span className={`player-rank ${idx === 0 && topPts > 0 ? 'first' : ''}`}>
+                #{idx + 1}
+              </span>
+              <Avatar player={p} size={24} />
+              <span className="player-name" title={p.name}>
+                {botDiff ? `${botDiff.icon} ` : ''}
+                {p.name}
+              </span>
+              {isMe && <span className="me-tag">ты</span>}
+              <span className="player-status">{status}</span>
+              <span className="chip-tokens">🪙{p.tokens}</span>
+            </div>
+            {!isSpec && (
+              <MiniBoard
+                marks={rows}
+                maxRows={Math.max(rows.length, maxAttempts)}
+                cols={wordLen}
+                lettered={lettered || isMe}
+                revealedWords={revealed}
+              />
+            )}
+            <div className="player-foot">
+              <span className="player-pts">
+                {isLeader ? '👑 ' : ''}
+                {fmtPts(p.points)} очк.
+              </span>
+              {isMe && <span className="player-place-label">{idx + 1}-е место</span>}
+            </div>
           </div>
         );
       })}
@@ -100,265 +159,277 @@ function Scoreboard({ state, meId }) {
   );
 }
 
-function maxPtsOf(state) {
-  return state.settings.pointsToWin;
-}
-
-function TurnTimer({ startedAt, seconds }) {
+function TickTimer({ startedAt, seconds, soundActive = false }) {
   const [, force] = useState(0);
+  const lastBeepRef = useRef(null);
   useEffect(() => {
-    const t = setInterval(() => force((x) => x + 1), 1000);
+    const t = setInterval(() => force((x) => x + 1), 250);
     return () => clearInterval(t);
   }, []);
+  const left = startedAt ? Math.max(0, seconds - Math.floor((Date.now() - startedAt) / 1000)) : 0;
+  useEffect(() => {
+    if (!startedAt || !soundActive) return;
+    if (left >= 1 && left <= 5 && lastBeepRef.current !== left) {
+      lastBeepRef.current = left;
+      sfx.tick(left <= 2);
+    }
+  }, [left, startedAt, soundActive]);
   if (!startedAt) return null;
-  const left = Math.max(0, seconds - Math.floor((Date.now() - startedAt) / 1000));
   return <span className={`turn-timer ${left <= 10 ? 'urgent' : ''}`}>⏱ {left}с</span>;
 }
 
-// Полоска порядка ходов: позиции и кто стартует по раундам блока
-function OrderStrip({ state, nameOf }) {
-  const r = state.round;
-  if (!state.order || !r?.nextStarters) return null;
-  const starters = r.nextStarters.filter(Boolean);
-  return (
-    <div className="order-strip">
-      <span className="order-label">места:</span>
-      {state.order.map((id, i) => (
-        <span key={id} className={`order-chip ${id === r.turnId ? 'now' : ''} ${id === r.starterId ? 'starter' : ''}`}>
-          {i + 1}. {nameOf(id)}
-        </span>
-      ))}
-      {starters.length > 0 && (
-        <>
-          <span className="order-label">старты:</span>
-          {starters.map((id, i) => (
-            <span key={i} className="order-start">{nameOf(id)}</span>
-          ))}
-        </>
-      )}
-    </div>
-  );
+function formatLogItem(item, nameOf) {
+  switch (item.type) {
+    case 'roundEvent':
+      return { icon: '🎲', text: `Событие: ${item.title}` };
+    case 'cream':
+      return { icon: '🥛', text: `${nameOf(item.by)} проверил букву («Первые сливки»)` };
+    case 'sniper':
+      return { icon: '🎯', text: `${nameOf(item.by)} пробил позицию («Подойник»)` };
+    case 'peek':
+      return { icon: '🕵️', text: `${nameOf(item.by)} подсмотрел слова ${nameOf(item.target)}` };
+    case 'recon':
+      return { icon: '👀', text: `${nameOf(item.by)} залил 2 слова («Разведка»)` };
+    case 'intercept':
+      return { icon: '🐄', text: `${nameOf(item.by)} перехватил ход ${nameOf(item.target)}!`, dirty: true };
+    case 'steal':
+      return { icon: '🕵️', text: `${nameOf(item.by)} затеял Деревенскую кражу!`, dirty: true };
+    case 'stealDone':
+      return { icon: '🔄', text: `Слово раунда сменилось по краже ${nameOf(item.by)}!`, dirty: true };
+    case 'skip':
+      return { icon: '⏰', text: `${nameOf(item.by)} проспал тик (+1 талон)` };
+    case 'win':
+      return { icon: '🏆', text: `${(item.winners || []).map(nameOf).join(', ')} угадал (+${fmtPts(item.pts)} очк.)` };
+    default:
+      return { icon: '🥛', text: 'Движение в хлеву' };
+  }
 }
 
-// Личная панель подсказок — видна только тебе
-function HintsPanel({ privateData }) {
-  if (!privateData.hints.length && !privateData.whispers.length) return null;
+// правая колонка: приватные знания + лента событий раунда
+function HintCards({ privateData, roundLog = [], nameOf }) {
+  const hints = privateData.hints || [];
+  const peeks = privateData.peeks || [];
+  if (!hints.length && !peeks.length && !roundLog.length) return null;
   return (
-    <div className="hints-panel">
-      {privateData.hints.map((h, i) => (
-        <span key={`h${i}`} className="hint-chip">
-          🤫 {h.letter.toUpperCase()} — {h.inWord ? 'есть' : 'нет'}
-        </span>
-      ))}
-      {privateData.whispers.length > 0 && (
-        <span className="hint-chip whisper">👂 {privateData.whispers.map((w) => w.toUpperCase()).join(', ')}</span>
-      )}
-    </div>
-  );
-}
-
-function WaitingRow({ name }) {
-  return (
-    <div className="row wait-row">
-      <div className="wait-label">{name} думает<span className="dots"><i>.</i><i>.</i><i>.</i></span></div>
-      {[...Array(5)].map((_, i) => (
-        <Tile key={i} i={i} />
-      ))}
-    </div>
-  );
-}
-
-// Правила молочной битвы — одинаково показываются во всех оверлеях розыгрыша
-function SmkRules() {
-  return (
-    <div className="smk-rules">
-      <div>🧀 Сыр затыкает 🫗 Кувшин</div>
-      <div>🫗 Кувшин наливает 🥛 Молоко</div>
-      <div>🥛 Молоко створаживается в 🧀 Сыр</div>
-    </div>
-  );
-}
-
-function DrawOverlay({ state, meId, actions }) {
-  const voted = state.draw?.voted || [];
-  const iVoted = voted.includes(meId);
-  const total = alive(state).length;
-  const teamMode = state.settings.teamMode;
-  const cowText = useMemo(() => line('drawStart', {}, `draw${state.eventSeq}`), [state.eventSeq]);
-  return (
-    <div className="overlay">
-      <div className="panel">
-        <h2>{teamMode ? 'Делимся на команды!' : 'Раздаем места!'}</h2>
-        <Cow text={cowText} mood="wink" />
-        {teamMode ? (
+    <aside className="hints-col">
+      <div className="hints-list">
+        {(hints.length > 0 || peeks.length > 0) && (
           <>
-            <div className="smk-rules">
-              <div>1. Голосуй за команду: 🥚 Яйцо или 🐔 Курица</div>
-              <div>2. Команды должны выйти ровными — иначе переголосуем</div>
-              <div>3. Затем битва в Сыр-Молоко-Кувшин расставит чередование ходов</div>
-              <div>4. Угадал игрок — очко летит КОМАНДЕ</div>
-            </div>
-          </>
-        ) : (
-          <div className="smk-rules">
-            <div>1. Голосуй за 🥚 или 🐔 — голоса скрыты до конца</div>
-            <div>2. Меньшие в меньшинстве — они первыми разбирают места</div>
-            <div>3. Остальные бьются парами в Сыр-Молоко-Кувшин</div>
-            <div>4. С победителя и вниз выбираются позиции в очереди</div>
-          </div>
-        )}
-        <p className="hint">⏱ {state.draw?.seconds}с — кто медлит, за того голосует Зорька</p>
-        {iVoted ? (
-          <p className="hint">Выбор сделан. Ждем остальных… ({voted.length}/{total})</p>
-        ) : (
-          <div className="draw-btns">
-            <button className="btn ghost draw-btn" onClick={() => actions.drawPick('egg')}>🥚 Яйцо</button>
-            <button className="btn ghost draw-btn" onClick={() => actions.drawPick('hen')}>🐔 Курица</button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function PickPosOverlay({ state, meId, actions }) {
-  const isMe = state.pick.pickerId === meId;
-  const pickerName = state.players.find((p) => p.id === state.pick.pickerId)?.name || 'кто-то';
-  const cowText = useMemo(
-    () => (isMe ? line('drawMinority', {}, `pick${state.eventSeq}`) : `Тише… ${pickerName} выбирает место в очереди.`),
-    [isMe, pickerName, state.eventSeq],
-  );
-  return (
-    <div className="overlay">
-      <div className="panel">
-        <h2>{isMe ? 'Твое место!' : `${pickerName} выбирает место`}</h2>
-        <Cow text={cowText} mood={isMe ? 'happy' : 'idle'} />
-        <p className="hint">Позиция 1 — открываешь слово. Последняя — крадешь победу. ⏱ {state.pick?.seconds}с</p>
-        {isMe ? (
-          <div className="pos-btns">
-            {state.pick.freePositions.map((i) => (
-              <button key={i} className="pos-btn" onClick={() => actions.pickPos(i)}>{i + 1}</button>
+            <div className="hints-title">Приватные знания ({hints.length + peeks.length})</div>
+            {hints.map((h, i) =>
+              h.type === 'pos' ? (
+                <div key={`p${i}`} className={`hint-card ${h.atPos ? 'sniper-hit' : 'sniper-miss'}`}>
+                  <span className="hint-card-head">🎯 Снайперский подойник</span>
+                  <span className="hint-card-body">
+                    Позиция {h.pos + 1} — <b>{h.letter.toUpperCase()}</b> {h.atPos ? '— точное попадание ✓' : '— мимо этой позиции'}
+                  </span>
+                </div>
+              ) : (
+                <div key={`c${i}`} className="hint-card">
+                  <span className="hint-card-head">🥛 Первые сливки</span>
+                  <span className="hint-card-body">
+                    Буква <b>{h.letter.toUpperCase()}</b> — {h.inWord ? 'есть в слове' : 'нет в слове'}
+                  </span>
+                </div>
+              ),
+            )}
+            {peeks.map((pk, i) => (
+              <div key={`k${i}`} className="hint-card peek-card">
+                <span className="hint-card-head">🕵️ Прошлые надои — {nameOf(pk.target)}</span>
+                <span className="hint-card-body">Порядок перемешан:</span>
+                <span className="peek-words">
+                  {pk.words.map((w, wi) => (
+                    <span key={wi} className="peek-word">{w.toUpperCase()}</span>
+                  ))}
+                </span>
+              </div>
             ))}
-          </div>
-        ) : (
-          <p className="hint">Ждем выбора…</p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function SmkOverlay({ state, meId, actions }) {
-  const smk = state.smk;
-  const myPair = smk.pairs.find(([a, b]) => a === meId || b === meId);
-  const opponentId = myPair ? (myPair[0] === meId ? myPair[1] : myPair[0]) : null;
-  const opponent = state.players.find((p) => p.id === opponentId)?.name || null;
-  const iAmBye = smk.bye === meId;
-  const drops = smk.drops.map((id) => state.players.find((p) => p.id === id)?.name).join(', ');
-  const cowText = useMemo(() => line('smkStart', {}, `smk${state.eventSeq}`), [state.eventSeq]);
-  const [myPick, setMyPick] = useState(null);
-  useEffect(() => setMyPick(null), [state.phase, smk.pairs]);
-  return (
-    <div className="overlay">
-      <div className="panel">
-        <h2>Сыр-Молоко-Кувшин</h2>
-        <Cow text={cowText} mood="idle" />
-        <SmkRules />
-        {drops && <p className="hint">Выбыли: {drops}</p>}
-        {myPair && !myPick ? (
-          <>
-            <p className="hint">Твоя пара: <b>{opponent}</b>. ⏱ {smk.seconds}с</p>
-            <div className="draw-btns">
-              {SMK.map((s) => (
-                <button key={s.sym} className="btn ghost draw-btn" onClick={() => { setMyPick(s.sym); actions.smkPick(s.sym); }}>
-                  {s.label}
-                </button>
-              ))}
-            </div>
           </>
-        ) : iAmBye ? (
-          <p className="hint">Нечетное число — ты без пары и проходишь дальше! 😏</p>
-        ) : myPair ? (
-          <p className="hint">Ход сделан… ждем {opponent}</p>
-        ) : (
-          <p className="hint">Бьются пары, жди своей очереди…</p>
+        )}
+
+        {roundLog.length > 0 && (
+          <>
+            <div className="hints-title log-title">📜 Лента хлева ({roundLog.length})</div>
+            {[...roundLog].reverse().map((item, idx) => {
+              const info = formatLogItem(item, nameOf);
+              return (
+                <div key={`log-${roundLog.length - idx}`} className={`hint-card log-card ${info.dirty ? 'dirty-log' : ''}`}>
+                  <div className="log-card-row">
+                    <span className="log-tick-badge">Тик {item.tick}</span>
+                    <span className="log-card-text">
+                      {info.icon} {info.text}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </>
         )}
       </div>
+    </aside>
+  );
+}
+
+function LetterGrid({ onPick, lang = 'ru' }) {
+  const LETTERS = lang === 'en'
+    ? [...'abcdefghijklmnopqrstuvwxyz']
+    : [...'абвгдежзийклмнопрстуфхцчшщъыьэюя'];
+  return (
+    <div className="letter-grid">
+      {LETTERS.map((ch) => (
+        <button key={ch} className="letter-btn" onClick={() => onPick(ch)}>
+          {ch.toUpperCase()}
+        </button>
+      ))}
     </div>
   );
 }
 
-// Меню усилений: тратим жетон, часть усилений требует твоего хода
-function PowerOverlay({ state, meId, menu, setMenu, actions, nameOf }) {
+// меню способностей: две секции — тратящие попытку и нет
+function PowerOverlay({ state, meId, myRows, menu, setMenu, actions }) {
   const me = state.players.find((p) => p.id === meId);
-  const myTurn = state.round?.turnId === meId;
+  const r = state.round;
+  const submitted = r.submittedIds.includes(meId);
+  const done = r.doneIds.includes(meId);
   const close = () => setMenu(null);
+  const canFree = !submitted && !done; // сливки/подойник/прошлые надои
+  const canSpend = canFree; // способности за попытку: доска не ограничена
 
-  // кандидаты для заморозки: все живые, кроме тебя
-  const freezeTargets = state.round
-    ? state.round.order
-        .filter((id) => id !== meId)
-        .map((id) => state.players.find((p) => p.id === id))
-        .filter((p) => p && p.connected)
-    : [];
+  const targets = Object.keys(r.boards)
+    .filter((id) => id !== meId && !r.doneIds.includes(id))
+    .map((id) => state.players.find((p) => p.id === id))
+    .filter(Boolean);
+
+  // «Прошлые надои»: подсматривать можно у тех, кто уже налил хоть ряд
+  const peekTargets = Object.keys(r.boards)
+    .filter((id) => id !== meId && (r.boards[id]?.length ?? 0) > 0)
+    .map((id) => state.players.find((p) => p.id === id))
+    .filter(Boolean);
 
   if (menu === 'menu') {
     return (
       <div className="overlay" onClick={close}>
         <div className="panel" onClick={(e) => e.stopPropagation()}>
-          <h2>Усиления 🧪 (жетонов: {me.tokens})</h2>
+          <h2>Талоны 🥛 (осталось: {me.tokens})</h2>
+          <div className="power-section">Не тратят попытку:</div>
           <div className="power-list">
-            <button className="power-item" disabled={!myTurn} onClick={() => setMenu('reveal')}>
-              <b>📍 Открыть букву</b><span>публично раскрыть букву на позиции</span>
+            <button className="power-item" disabled={!canFree || me.tokens < 1} onClick={() => setMenu('cream')}>
+              <b>🥛 Первые сливки — 1</b>
+              <span>есть ли буква в слове? Ответ видишь только ты</span>
             </button>
-            <button className="power-item" disabled={!myTurn} onClick={() => setMenu('swap')}>
-              <b>🔄 Сменить слово</b><span>новое слово всем, старые данные помечаются</span>
-            </button>
-            <button className="power-item" disabled={!myTurn} onClick={() => setMenu('freeze')}>
-              <b>🧊 Заморозка</b><span>любой игрок пропустит свой следующий ход</span>
-            </button>
-            <button className="power-item" disabled={!myTurn} onClick={() => setMenu('whisper')}>
-              <b>👂 Шепот Зорьки</b><span>3 приватных слова-кандидата</span>
+            <button className="power-item" disabled={!canFree || me.tokens < 2} onClick={() => setMenu('sniper')}>
+              <b>🎯 Снайперский подойник — 2</b>
+              <span>буква на конкретной позиции — приватно</span>
             </button>
           </div>
-          {!myTurn && <p className="hint">Эти усиления тратят твой ход — жди очереди</p>}
+          <div className="power-section">Тратят попытку:</div>
+          <div className="power-list">
+            <button className="power-item" disabled={!canFree || me.tokens < 2 || peekTargets.length === 0} onClick={() => setMenu('peek')}>
+              <b>🕵️ Прошлые надои — 2</b>
+              <span>подсмотреть написанные слова соперника — порядок перемешан</span>
+            </button>
+            <button className="power-item" disabled={!canSpend || me.tokens < 1} onClick={() => setMenu('recon')}>
+              <b>👀 Сексуальная разведка — 1</b>
+              <span>2 случайных слова из базы лягут на твою доску</span>
+            </button>
+            <button className="power-item" disabled={!canSpend || me.tokens < 2 || targets.length === 0} onClick={() => setMenu('intercept')}>
+              <b>🐄 Белковый перехват — 2</b>
+              <span>подменить написанное слово противника случайным</span>
+            </button>
+            <button className="power-item" disabled={!canSpend || me.tokens < 3} onClick={() => setMenu('steal')}>
+              <b>🕵️ Деревенская кража — 3</b>
+              <span>сменить общее слово: чужие ряды помечаются старыми</span>
+            </button>
+          </div>
+          {submitted && <p className="hint">В этом тике ты уже отправил слово — способности сливают до отправки</p>}
           <button className="btn ghost" onClick={close}>Закрыть</button>
         </div>
       </div>
     );
   }
 
-  if (menu === 'reveal') {
+  if (menu === 'cream') {
     return (
       <div className="overlay" onClick={close}>
         <div className="panel" onClick={(e) => e.stopPropagation()}>
-          <h2>📍 Открыть букву</h2>
-          <p className="hint">Выбери позицию — ее буква станет видна всем (за твой ход).</p>
-          <div className="pos-btns">
-            {[0, 1, 2, 3, 4].map((i) => (
-              <button key={i} className="pos-btn" onClick={() => { actions.power('reveal', { pos: i }); close(); }}>
-                {i + 1}
-              </button>
-            ))}
-          </div>
-          <button className="btn ghost" onClick={close}>Назад</button>
+          <h2>🥛 Первые сливки</h2>
+          <p className="hint">Проверь, есть ли буква в слове. Увидишь только ты. Попытку не тратит.</p>
+          <LetterGrid lang={state.round?.lang} onPick={(ch) => { actions.power('cream', { letter: ch }); close(); }} />
+          <button className="btn ghost" onClick={close}>Закрыть</button>
         </div>
       </div>
     );
   }
 
-  if (menu === 'freeze') {
+  if (menu === 'sniper') {
     return (
       <div className="overlay" onClick={close}>
         <div className="panel" onClick={(e) => e.stopPropagation()}>
-          <h2>🧊 Заморозка</h2>
-          <p className="hint">Кого отправить в молочный лед? Пропустит свой следующий ход.</p>
+          <h2>🎯 Снайперский подойник</h2>
+          <p className="hint">Выбери букву, потом позицию. Увидишь только ты. Попытку не тратит.</p>
+          <LetterGrid lang={state.round?.lang} onPick={(ch) => { setMenu(`sniper-pos:${ch}`); }} />
+          <button className="btn ghost" onClick={() => setMenu('menu')}>Назад</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (menu?.startsWith('sniper-pos:')) {
+    const ch = menu.split(':')[1];
+    return (
+      <div className="overlay" onClick={close}>
+        <div className="panel" onClick={(e) => e.stopPropagation()}>
+          <h2>🎯 Позиция для «{ch.toUpperCase()}»</h2>
+          <div className="pos-btns">
+            {Array.from({ length: state.round?.wordLength || state.settings.wordLength || 5 }).map((_, i) => (
+              <button key={i} className="pos-btn" onClick={() => { actions.power('sniper', { letter: ch, pos: i }); close(); }}>
+                {i + 1}
+              </button>
+            ))}
+          </div>
+          <button className="btn ghost" onClick={() => setMenu('sniper')}>Назад</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (menu === 'peek') {
+    return (
+      <div className="overlay" onClick={close}>
+        <div className="panel" onClick={(e) => e.stopPropagation()}>
+          <h2>🕵️ Прошлые надои</h2>
+          <p className="hint">Чьи налитые слова подсмотреть? Порядок слов перемешается — сопоставляй с плитками сам. Попытку не тратит.</p>
           <div className="power-list">
-            {freezeTargets.map((p) => (
+            {peekTargets.map((p) => (
               <button
                 key={p.id}
                 className="power-item freeze-target"
-                onClick={() => { actions.power('freeze', { target: p.id }); close(); }}
+                onClick={() => { actions.power('peek', { target: p.id }); close(); }}
+              >
+                <Avatar player={p} size={26} />
+                <b>{p.name}</b>
+                <span>({r.boards[p.id].length} рядов)</span>
+              </button>
+            ))}
+          </div>
+          <button className="btn ghost" onClick={() => setMenu('menu')}>Назад</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (menu === 'intercept') {
+    return (
+      <div className="overlay" onClick={close}>
+        <div className="panel" onClick={(e) => e.stopPropagation()}>
+          <h2>🐄 Белковый перехват</h2>
+          <p className="hint">Чье слово подменить случайным? Жертва узнает.</p>
+          <div className="power-list">
+            {targets.map((p) => (
+              <button
+                key={p.id}
+                className="power-item freeze-target"
+                onClick={() => { actions.power('intercept', { target: p.id }); close(); }}
               >
                 <Avatar player={p} size={26} />
                 <b>{p.name}</b>
@@ -371,18 +442,17 @@ function PowerOverlay({ state, meId, menu, setMenu, actions, nameOf }) {
     );
   }
 
-  const confirmKind = { swap: '🔄 Сменить слово', whisper: '👂 Шепот Зорьки' }[menu];
+  const confirmKind = { recon: ['👀 Сексуальная разведка', '2 случайных слова лягут на твою доску и займут 2 ряда.'], steal: ['🕵️ Деревенская кража', 'Общее слово сменится. Все чужие ряды (и твои) помечаются старыми.'] }[menu];
   if (confirmKind) {
     return (
       <div className="overlay" onClick={close}>
         <div className="panel" onClick={(e) => e.stopPropagation()}>
-          <h2>{confirmKind}</h2>
-          {menu === 'swap' && <p className="hint">Слово сменится для всех. Старые попытки останутся с пометкой «старое слово», личные подсказки сгорят.</p>}
-          {menu === 'whisper' && <p className="hint">Зорька приватно подскажет 3 слова, совместимых с открытыми данными.</p>}
+          <h2>{confirmKind[0]}</h2>
+          <p className="hint">{confirmKind[1]}</p>
           <button className="btn primary" onClick={() => { actions.power(menu); close(); }}>
-            Тратить жетон 🪙
+            Тратить талон 🥛
           </button>
-          <button className="btn ghost" onClick={close}>Назад</button>
+          <button className="btn ghost" onClick={() => setMenu('menu')}>Назад</button>
         </div>
       </div>
     );
@@ -390,128 +460,283 @@ function PowerOverlay({ state, meId, menu, setMenu, actions, nameOf }) {
   return null;
 }
 
-// Сетка для проверки буквы (приватно, в любой момент раунда)
-function CheckOverlay({ setMenu, actions }) {
+// меню: создать комнату или присоединиться к чужой
+function MenuScreen({ me, roomList, connected, actions, muted, setMuted, onSwitchSolo }) {
+  const rooms = roomList || [];
+  const [roomName, setRoomName] = useState('');
+  const [isPrivate, setIsPrivate] = useState(false);
+  const [joinCode, setJoinCode] = useState('');
+
+  const create = () => {
+    const name = roomName.trim() || `Комната ${me.name}`;
+    actions.createRoom(name, 'closed', isPrivate);
+    setRoomName('');
+  };
+
+  const joinByCode = () => {
+    const code = joinCode.trim().toUpperCase();
+    if (!code) return;
+    actions.joinRoom(code);
+    setJoinCode('');
+  };
+
   return (
-    <div className="overlay" onClick={() => setMenu(null)}>
-      <div className="panel" onClick={(e) => e.stopPropagation()}>
-        <h2>🤫 Проверить букву</h2>
-        <p className="hint">Ответ увидишь только ты. Жетон тратится, ход — нет.</p>
-        <div className="letter-grid">
-          {LETTERS.map((ch) => (
-            <button key={ch} className="letter-btn" onClick={() => { actions.power('check', { letter: ch }); setMenu(null); }}>
-              {ch.toUpperCase()}
+    <div className="game menu">
+      <header className="top">
+        <div className="top-group">
+          <span className="round-badge">меню</span>
+          {onSwitchSolo && (
+            <button className="mode-pill-btn" onClick={onSwitchSolo} title="Вернуться в соло-игру">
+              🎯 Соло
             </button>
-          ))}
+          )}
         </div>
-        <button className="btn ghost" onClick={() => setMenu(null)}>Закрыть</button>
+        <h1 className="logo">МОЛОКО</h1>
+        <button
+          className="icon-btn"
+          title={muted ? 'Включить звуки' : 'Выключить звуки'}
+          onClick={() => setMuted(sfx.toggleMute())}
+        >
+          {muted ? '🔇' : '🔊'}
+        </button>
+      </header>
+      <Cow text={me ? `Привет, ${me.name}! Создай комнату для своей группы или заходи к чужим дояркам.` : 'Доим Discord…'} mood="wink" />
+      <input
+        className="room-name-input"
+        placeholder={`Название комнаты (по умолчанию: Комната ${me.name})`}
+        maxLength={30}
+        value={roomName}
+        onChange={(e) => setRoomName(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && create()}
+      />
+      <div className="menu-row">
+        <button
+          type="button"
+          className={`chip-btn wide-chip ${isPrivate ? 'on' : ''}`}
+          onClick={() => setIsPrivate((v) => !v)}
+          title="Скрытая комната не отображается в общем списке — вход только по 4-буквенному коду"
+        >
+          {isPrivate ? '🕵️ Скрытая (по коду)' : '🌐 Публичная комната'}
+        </button>
+        <button
+          className="btn primary"
+          style={{ flex: 1 }}
+          disabled={!connected || !me}
+          onClick={create}
+        >
+          🐄 Создать комнату
+        </button>
       </div>
+
+      <div className="join-code-row">
+        <input
+          className="room-name-input code-input"
+          placeholder="Код (4 симв.)"
+          maxLength={6}
+          value={joinCode}
+          onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+          onKeyDown={(e) => e.key === 'Enter' && joinByCode()}
+        />
+        <button
+          className="btn ghost"
+          disabled={!connected || !me || !joinCode.trim()}
+          onClick={joinByCode}
+        >
+          🔑 Войти по коду
+        </button>
+      </div>
+
+      <div className="menu-section">Открытые комнаты в хлеву:</div>
+      <div className="room-list">
+        {rooms.map((r) => (
+          <button key={r.id} className="room-item" onClick={() => actions.joinRoom(r.id)}>
+            <span className="room-name">{r.visibility === 'open' ? '🔓' : '🔒'} {r.name}</span>
+            <span className="room-meta">
+              👤 {r.players}/8 · {r.lang === 'en' ? '🇬🇧' : '🇷🇺'} ·{' '}
+              {r.phase === 'lobby' ? 'ждут' : r.phase === 'round' ? 'играют' : 'пауза'}
+            </span>
+            <span className="room-code">{r.id}</span>
+          </button>
+        ))}
+        {rooms.length === 0 && <div className="hint">Пока пусто — создай первую комнату или введи код!</div>}
+      </div>
+      {!connected && <p className="hint">Связываюсь с сервером…</p>}
+      <p className="hint small">Игроки в одной комнате мешают друг другу как хотят. Талоны, шпионаж и доение прилагаются.</p>
     </div>
   );
 }
 
-export default function PartyGame({ me }) {
-  const { state, connected, toasts, reactions, privateData, clearPrivate, pushToast, actions } = useParty(me);
-  const [cur, setCur] = useState('');
+export default function PartyGame({ me, onSwitchSolo }) {
+  const { state, connected, inRoom, roomList, toasts, reactions, privateData, clearPrivate, pushToast, actions } = useParty(me);
+  const [cells, setCells] = useState(['', '', '', '', '']);
+  const [cursorPos, setCursorPos] = useState(0);
   const [cowText, setCowText] = useState('Приветик… Зорька уже налила. Зови народ!');
-  const [menu, setMenu] = useState(null); // null | menu | reveal | swap | freeze | whisper | check
+  const [menu, setMenu] = useState(null);
   const [muted, setMuted] = useState(sfx.isMuted());
-  const prev = useRef({ boardLen: 0, turnId: null, reveals: 0, frozenId: null, swapCount: 0, phase: null, roundN: null });
+  const [armed, setArmed] = useState(null);
+  const prev = useRef({ myRowsLen: 0, tick: 0, lastSeq: 0, phase: null, roundN: null, winnersLen: -1 });
 
-  const myTurn = Boolean(me && state?.phase === 'round' && state.round?.turnId === me.id);
+  const r = state?.round;
+  const lang = r?.lang || state?.settings.lang || 'ru';
+  const wordLen = r?.wordLength || state?.settings.wordLength || 5;
+  const myRows = privateData.myRows || [];
+  const hints = privateData.hints || [];
+  const roundLog = r?.log || [];
+
+  const submitted = Boolean(r && r.submittedIds.includes(me?.id));
+  const done = Boolean(r && r.doneIds.includes(me?.id));
+  const isSpectator = Boolean(r && r.boards && !r.boards[me?.id]);
+  const canSubmit = state?.phase === 'round' && !submitted && !done && !isSpectator;
   const myTokens = state?.players.find((p) => p.id === me?.id)?.tokens ?? 0;
   const nameOf = (id) => state?.players.find((p) => p.id === id)?.name || 'кто-то';
 
-  // Реплики Зорьки: seed = номер события на сервере, поэтому фраза
-  // у всех игроков в комнате одинаковая в один и тот же момент
+  // клавиатура: метки своих рядов + приватные знания сливок и подойника
+  const marks = useMemo(() => {
+    const m = keyboardMarks(myRows);
+    for (const h of hints) {
+      if (h.type === 'pos' && h.atPos) m[h.letter] = 'correct';
+      else if (h.inWord === true && (!m[h.letter] || m[h.letter] === 'absent')) m[h.letter] = 'present';
+      else if (h.inWord === false && !m[h.letter]) m[h.letter] = 'absent';
+    }
+    return m;
+  }, [myRows, hints]);
+  const knownPos = useMemo(() => {
+    const kp = {};
+    for (const h of hints) if (h.type === 'pos' && h.atPos) kp[h.letter] = h.pos;
+    return kp;
+  }, [hints]);
+
+  // события комнаты: реплики Зорьки синхронны (seed = номер события) + звуки
   useEffect(() => {
     if (!state) return;
     const pv = prev.current;
-    const r = state.round;
     const seed = state.eventSeq;
 
-    if (state.phase === 'round' && r) {
-      if (r.board.length > pv.boardLen && r.board.length > 0) {
-        const last = r.board[r.board.length - 1];
-        // звук переворота — тик на каждую букву с задержкой анимации
-        [...last.marks].forEach((m, i) => setTimeout(() => sfx.flip(i), i * 280));
-        if (last.marks.some((m) => m === 'correct')) setTimeout(() => sfx.hit(), 1450);
-        if (r.winnerId) {
-          sfx.win();
-          setCowText(line('point', { NAME: last.byName }, seed));
-        } else {
-          const juicy = last.marks.filter((m) => m !== 'absent').length >= 2;
-          setCowText(line(juicy ? 'partyGood' : 'partyBad', {}, seed));
-        }
+    if (myRows.length > pv.myRowsLen) {
+      const newCount = myRows.length - pv.myRowsLen;
+      const fresh = myRows.slice(-newCount);
+      fresh.forEach((row, i) => setTimeout(() => sfx.flip(i), i * 280));
+      if (fresh.some((row) => row.marks.some((m) => m === 'correct'))) {
+        setTimeout(() => sfx.hit(), newCount * 280);
       }
-      if (pv.turnId !== null && r.turnId !== pv.turnId) {
-        // одна фраза на всех: обращаемся к текущему игроку в третьем лице
-        setCowText(line('otherTurn', { NAME: nameOf(r.turnId) }, `turn:${seed}`));
-      }
-      if (state.reveals.length > pv.reveals) {
-        setCowText(line('revealUsed', { NAME: state.reveals[state.reveals.length - 1].by }, seed));
-      }
-      if (state.frozenId && state.frozenId !== pv.frozenId) {
+    }
+    if (state.lastEvent && state.lastEvent.seq !== pv.lastSeq) {
+      const ev = state.lastEvent;
+      if (ev.type === 'intercept') {
         sfx.freeze();
-        setCowText(
-          state.frozenId === me?.id
-            ? line('frozenVictim', {}, seed)
-            : line('freezeUsed', { NAME: nameOf(pv.turnId), TARGET: nameOf(state.frozenId) }, `fz:${seed}`),
-        );
-      }
-      if (state.swapCount > pv.swapCount) {
-        setCowText(line('swapUsed', { NAME: nameOf(pv.turnId) }, seed));
+        setCowText(line('interceptUsed', { NAME: nameOf(ev.by), TARGET: nameOf(ev.target) }, seed));
+      } else if (ev.type === 'steal') setCowText(line('stealUsed', { NAME: nameOf(ev.by) }, seed));
+      else if (ev.type === 'recon') setCowText(line('reconUsed', { NAME: nameOf(ev.by) }, seed));
+      else if (ev.type === 'cream') setCowText(line('creamUsed', { NAME: nameOf(ev.by) }, seed));
+      else if (ev.type === 'sniper') setCowText(line('sniperUsed', { NAME: nameOf(ev.by) }, seed));
+      else if (ev.type === 'peek') setCowText(line('peekUsed', { NAME: nameOf(ev.by) }, seed));
+      else if (ev.type === 'skip') setCowText(line('skipTimeout', { NAME: nameOf(ev.by) }, seed));
+      else if (ev.type === 'roundEvent') {
+        if (ev.eventId === 'double') setCowText(line('eventDouble', {}, seed));
+        else if (ev.eventId === 'generous') setCowText(line('eventGenerous', {}, seed));
+        else if (ev.eventId === 'firstLetter') setCowText(line('eventFirstLetter', {}, seed));
+      } else if (ev.type === 'win') {
+        sfx.win();
+        if (ev.winners.length === 1) {
+          setCowText(line('point', { NAME: nameOf(ev.winners[0]), PTS: fmtPts(ev.pts), TICK: ev.tick }, seed));
+        } else {
+          setCowText(
+            line('pointSplit', { NAMES: ev.winners.map(nameOf).join(' и '), PTS: fmtPts(ev.pts) }, seed),
+          );
+        }
+      } else if (ev.type === 'noWinner') {
+        sfx.lose();
+        setCowText(line('noWinner', { WORD: ev.word?.toUpperCase() }, seed));
       }
     }
-    if (state.phase === 'draw' && pv.phase !== 'draw' && pv.phase !== null) setCowText(line('drawStart', {}, `dr:${seed}`));
-    if (state.phase === 'smk' && pv.phase === 'pickpos') setCowText(line('drawTie', {}, `sm:${seed}`));
-    if (state.phase === 'smk' && pv.phase !== 'smk' && pv.phase !== 'pickpos' && pv.phase !== null) setCowText(line('smkStart', {}, `sm:${seed}`));
-    if (state.phase === 'pickpos' && pv.phase === 'smk') {
-      sfx.smk();
-      const winner = state.pick?.pickerId;
-      setCowText(line(winner === me?.id ? 'smkWin' : 'smkLose', { NAME: nameOf(winner) }, seed));
-    }
-    if (state.phase === 'matchEnd' && pv.phase !== 'matchEnd') sfx.fanfare();
-    if (state.phase === 'round' && pv.phase === 'pickpos') setCowText(line('orderSet', {}, seed));
 
-    // новый раунд или смена слова — личные подсказки сгорают
-    if ((r?.n ?? null) !== pv.roundN || state.swapCount !== pv.swapCount) clearPrivate();
+    if ((r?.n ?? null) !== pv.roundN) clearPrivate();
 
     prev.current = {
-      boardLen: r?.board.length ?? 0,
-      turnId: r?.turnId ?? null,
-      reveals: state.reveals.length,
-      frozenId: state.frozenId,
-      swapCount: state.swapCount,
+      myRowsLen: myRows.length,
+      tick: r?.tick ?? 0,
+      lastSeq: state.lastEvent?.seq ?? pv.lastSeq,
       phase: state.phase,
       roundN: r?.n ?? null,
+      winnersLen: r?.winners?.length ?? 0,
     };
-  }, [state, me, clearPrivate]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [state, me, myRows, hints, clearPrivate]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // каждый новый ход начинается с чистого поля ввода
+  // каждый новый раунд или тик начинается с чистого поля ввода
   useEffect(() => {
-    setCur('');
-  }, [state?.round?.turnId, state?.round?.n]);
+    setCells(Array(wordLen).fill(''));
+    setCursorPos(0);
+  }, [state?.round?.n, state?.round?.tick, wordLen]);
+
+  // двухшаговое подтверждение кнопок: сброс через 3 секунды
+  useEffect(() => {
+    if (!armed) return undefined;
+    const t = setTimeout(() => setArmed(null), 3000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  const selectCell = (idx) => {
+    if (!canSubmit) return;
+    if (idx >= 0 && idx < wordLen) setCursorPos(idx);
+  };
+
+  const moveCursor = (delta) => {
+    if (!canSubmit) return;
+    setCursorPos((p) => Math.max(0, Math.min(wordLen - 1, p + delta)));
+  };
 
   const pressKey = (ch) => {
-    if (!myTurn) return;
-    setCur((c) => (c.length < 5 ? c + ch : c));
+    if (!canSubmit) return;
+    setCells((prevCells) => {
+      const next = prevCells.length === wordLen ? [...prevCells] : Array(wordLen).fill('');
+      const pos = Math.min(wordLen - 1, Math.max(0, cursorPos));
+      next[pos] = ch;
+      let nextPos = pos;
+      const emptyAfter = next.findIndex((c, i) => i > pos && !c);
+      if (emptyAfter !== -1) nextPos = emptyAfter;
+      else if (pos < wordLen - 1) nextPos = pos + 1;
+      setCursorPos(nextPos);
+      return next;
+    });
   };
   const pressBack = () => {
-    if (!myTurn) return;
-    setCur((c) => c.slice(0, -1));
+    if (!canSubmit) return;
+    setCells((prevCells) => {
+      const next = prevCells.length === wordLen ? [...prevCells] : Array(wordLen).fill('');
+      const pos = Math.min(wordLen - 1, Math.max(0, cursorPos));
+      if (next[pos]) {
+        next[pos] = '';
+      } else if (pos > 0) {
+        next[pos - 1] = '';
+        setCursorPos(pos - 1);
+      }
+      return next;
+    });
   };
   const pressEnter = () => {
-    if (!myTurn) return;
-    const word = normalizeWord(cur);
-    if (word.length < 5) {
-      pushToast('Слово из 5 букв, солнышко');
+    if (!canSubmit) return;
+    if (cells.length !== wordLen || cells.some((c) => !c)) {
+      pushToast(
+        lang === 'en'
+          ? `Type a ${wordLen}-letter word, sweetie`
+          : `Слово из ${wordLen} букв, солнышко`,
+      );
+      return;
+    }
+    const word = normalizeWord(cells.join(''), lang, wordLen);
+    if (word.length < wordLen) {
+      pushToast(
+        lang === 'en'
+          ? `Type a ${wordLen}-letter word, sweetie`
+          : `Слово из ${wordLen} букв, солнышко`,
+      );
       return;
     }
     actions.guess(word);
-    setCur('');
+    setCells(Array(wordLen).fill(''));
+    setCursorPos(0);
   };
-  usePhysicalInput(pressKey, pressEnter, pressBack);
+  usePhysicalInput(pressKey, pressEnter, pressBack, lang, moveCursor);
 
   if (!me || !connected) {
     return (
@@ -519,6 +744,20 @@ export default function PartyGame({ me }) {
         <h1 className="logo">МОЛОКО</h1>
         <Cow text={me ? 'Связываюсь с хлевом…' : 'Доим Discord…'} mood="idle" />
       </div>
+    );
+  }
+
+  if (!inRoom) {
+    return (
+      <MenuScreen
+        me={me}
+        roomList={roomList}
+        connected={connected}
+        actions={actions}
+        muted={muted}
+        setMuted={setMuted}
+        onSwitchSolo={onSwitchSolo}
+      />
     );
   }
 
@@ -531,20 +770,25 @@ export default function PartyGame({ me }) {
     );
   }
 
-  const marks = keyboardMarks((state.round?.board || []).filter((row) => !row.old));
   const iAmChampion = state.championId === me.id;
   const readyCount = state.ready?.length || 0;
-  const isSpectator = Boolean(state.round && !state.round.order.includes(me.id));
-  const rotationAlive = state.round
-    ? state.round.order.filter((id) => state.players.find((p) => p.id === id)?.connected).length
-    : 0;
+  const aliveCount = state.players.filter((p) => p.connected).length;
   const iAmReady = state.ready?.includes(me.id);
+  const waiting = r
+    ? Object.keys(r.boards)
+        .filter((id) => id !== me?.id && !r.submittedIds.includes(id) && !r.doneIds.includes(id))
+        .map(nameOf)
+    : [];
 
   return (
     <div className="game party">
       <header className="top">
         <span className="round-badge">
-          {state.phase === 'lobby' ? 'лобби' : state.phase === 'draw' ? 'розыгрыш' : `слово №${state.round?.n ?? '—'}`}
+          {state.phase === 'lobby'
+            ? `лобби · ${state.roomId}`
+            : state.phase === 'round'
+              ? `слово №${r.n} · тик ${r.tick}/6`
+              : `слово №${r?.n ?? '—'}`}
         </span>
         <h1 className="logo">МОЛОКО</h1>
         <button
@@ -554,49 +798,95 @@ export default function PartyGame({ me }) {
         >
           {muted ? '🔇' : '🔊'}
         </button>
-        <span className="to-win">
-          {state.settings.teamMode
-            ? `🥚 ${state.teamPoints?.egg ?? 0} : ${state.teamPoints?.hen ?? 0} 🐔`
-            : `до ${state.settings.pointsToWin} очк.`}
-        </span>
+        <span className="to-win">до {state.settings.pointsToWin} очк.</span>
       </header>
 
       <div className="party-body">
         <aside className="side">
-          <Scoreboard state={state} meId={me.id} />
-          {state.phase === 'round' && (
-            <TurnTimer startedAt={state.round?.turnStartedAt} seconds={state.turnSeconds} />
+          <PlayerList state={state} meId={me.id} myRows={myRows} maxAttempts={state.maxAttempts} wordLen={wordLen} />
+          {state.phase === 'round' && !isSpectator && (
+            <TickTimer startedAt={r.tickStartedAt} seconds={state.tickSeconds} />
           )}
-          <HintsPanel privateData={privateData} />
+          <div className="side-actions">
+            {state.hostId === me.id && ['round', 'roundEnd'].includes(state.phase) && (
+              <button
+                className={`side-btn ${armed === 'end' ? 'danger' : ''}`}
+                onClick={() => (armed === 'end' ? (actions.endMatch(), setArmed(null)) : setArmed('end'))}
+              >
+                {armed === 'end' ? 'Точно завершить?' : 'Завершить матч'}
+              </button>
+            )}
+            {state.hostId === me.id && (
+              <button
+                className={`side-btn ${armed === 'delete' ? 'danger' : ''}`}
+                onClick={() => (armed === 'delete' ? (actions.deleteRoom(), setArmed(null)) : setArmed('delete'))}
+              >
+                {armed === 'delete' ? 'Точно распустить?' : 'Распустить комнату'}
+              </button>
+            )}
+            <button
+              className="side-btn"
+              onClick={() => (armed === 'leave' ? actions.leave() : setArmed('leave'))}
+            >
+              {armed === 'leave' ? 'Точно выйти?' : 'Выйти из комнаты'}
+            </button>
+          </div>
         </aside>
 
         <div className="main-col">
           {state.phase === 'lobby' && (
             <div className="panel lobby">
-              <Cow text={alive(state).length < 2 ? 'Один в хлеву скучно. Зови друзей!' : 'Народ собирается…'} mood="wink" />
+              <div className="room-code-bar">
+                <span>Код комнаты: <b>{state.roomId}</b></span>
+                {state.isPrivate && <span className="host-tag">🕵️ скрытая</span>}
+                <button
+                  type="button"
+                  className="chip-btn wide-chip"
+                  onClick={() => copyResult(state.roomId, pushToast)}
+                  title="Скопировать код комнаты"
+                >
+                  📋 Код
+                </button>
+              </div>
+              <Cow text={state.players.filter((p) => p.connected).length < 2 ? 'Один в хлеву скучно. Зови друзей или добавь бота!' : 'Народ собирается…'} mood="wink" />
               <div className="lobby-list">
-                {alive(state).map((p) => (
-                  <div className="lobby-player" key={p.id}>
-                    <Avatar player={p} />
-                    <div className="lobby-name">
+                {state.players.filter((p) => p.connected).map((p) => {
+                  const botDiff = p.isBot ? BOT_DIFFS[p.difficulty || 'normal'] : null;
+                  return (
+                    <div className="lobby-player" key={p.id}>
+                      <Avatar player={p} />
                       <span>{p.name}</span>
-                      {(p.achievements?.length || 0) > 0 && (
-                        <span className="ach-row">
-                          {p.achievements.map((a) => (
-                            <span key={a} className="ach-badge" title={ACH_TITLES[a] || a}>
-                              {ACH_ICONS[a] || '🏆'}
-                            </span>
-                          ))}
-                        </span>
+                      {p.id === state.hostId && <span className="host-tag">хост</span>}
+                      {p.isBot && botDiff && (
+                        <button
+                          type="button"
+                          className={`bot-diff-btn diff-${p.difficulty || 'normal'}`}
+                          disabled={!isHost(state, me)}
+                          title={botDiff.title}
+                          onClick={() => actions.setBotDifficulty(p.id, botDiff.next)}
+                        >
+                          {botDiff.label}
+                        </button>
+                      )}
+                      {p.isBot && isHost(state, me) && (
+                        <button
+                          type="button"
+                          className="bot-remove-btn"
+                          onClick={() => actions.removeBot(p.id)}
+                          title="Убрать бота"
+                        >
+                          ✕
+                        </button>
                       )}
                     </div>
-                    {state.settings.teamMode && p.team && (
-                      <span className="team-tag">{p.team === 'egg' ? '🥚' : '🐔'}</span>
-                    )}
-                    {p.id === state.hostId && <span className="host-tag">хост</span>}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
+              {isHost(state, me) && state.players.filter((p) => p.connected).length < 8 && (
+                <button type="button" className="btn ghost small-btn" onClick={() => actions.addBot('normal')}>
+                  + 🤖 Добавить бота
+                </button>
+              )}
               <div className="points-picker">
                 <span>Играем до:</span>
                 {POINT_OPTIONS.map((n) => (
@@ -611,119 +901,226 @@ export default function PartyGame({ me }) {
                 ))}
               </div>
               <div className="points-picker">
-                <span>Тема:</span>
-                {Object.entries(THEMES).map(([key, t]) => (
+                <span>Язык:</span>
+                {Object.entries(LANGS).map(([key]) => (
                   <button
                     key={key}
-                    className={`chip-btn ${state.settings.theme === key ? 'on' : ''}`}
+                    className={`chip-btn ${state.settings.lang === key ? 'on' : ''}`}
                     disabled={!isHost(state, me)}
-                    title={t.label}
-                    onClick={() => actions.setTheme(key)}
+                    onClick={() => actions.setLang(key)}
                   >
-                    {t.icon}
+                    {key === 'ru' ? '🇷🇺' : '🇬🇧'}
+                  </button>
+                ))}
+                <span style={{ marginLeft: 8 }}>Букв:</span>
+                {[5, 6, 7].map((n) => (
+                  <button
+                    key={n}
+                    className={`chip-btn ${state.settings.wordLength === n ? 'on' : ''}`}
+                    disabled={!isHost(state, me)}
+                    title={`Слова на ${n} букв`}
+                    onClick={() => actions.setWordLength(n)}
+                  >
+                    {n}
                   </button>
                 ))}
               </div>
               <div className="points-picker">
-                <span>Команды 2×{Math.max(2, Math.floor(alive(state).length / 2))}:</span>
+                <span>Темп тика:</span>
+                {TICK_OPTIONS.map(({ sec, label }) => (
+                  <button
+                    key={sec}
+                    className={`chip-btn wide-chip ${(state.settings.tickSeconds || state.tickSeconds) === sec ? 'on' : ''}`}
+                    disabled={!isHost(state, me)}
+                    onClick={() => actions.setTickSeconds(sec)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="points-picker">
+                <span>Режим:</span>
                 <button
-                  className={`chip-btn ${state.settings.teamMode ? 'on' : ''}`}
+                  className={`chip-btn wide-chip ${state.settings.visibility === 'closed' ? 'on' : ''}`}
                   disabled={!isHost(state, me)}
-                  onClick={() => actions.setTeamMode(!state.settings.teamMode)}
+                  title="Соперники видят только цвета твоих плиток (буквы раскроются в конце раунда)"
+                  onClick={() => actions.setVisibility('closed')}
                 >
-                  {state.settings.teamMode ? '🥚 VS 🐔 вкл' : 'выкл'}
+                  🔒 Закрытый
+                </button>
+                <button
+                  className={`chip-btn wide-chip ${state.settings.visibility === 'open' ? 'on' : ''}`}
+                  disabled={!isHost(state, me)}
+                  title="Соперники сразу видят буквы твоих рядов"
+                  onClick={() => actions.setVisibility('open')}
+                >
+                  🔓 Открытый
                 </button>
               </div>
-              <button className="btn primary" onClick={actions.start}>Начать матч</button>
-              <p className="hint small">Перед матчем разыгрываем порядок ходов. Угадал — очко. Ходы по кругу, стартующий сдвигается.</p>
+              <div className="points-picker">
+                <span>События Зорьки:</span>
+                <button
+                  className={`chip-btn wide-chip ${state.settings.eventsEnabled ? 'on' : ''}`}
+                  disabled={!isHost(state, me)}
+                  title="Случайные бонусные модификаторы со 2-го раунда (Золотой надой ×2, Щедрый хлев +2 талона, Парное молоко)"
+                  onClick={() => actions.setEventsEnabled(!state.settings.eventsEnabled)}
+                >
+                  {state.settings.eventsEnabled ? '🎲 Вкл' : 'Выкл'}
+                </button>
+              </div>
+              <button
+                className="btn primary"
+                onClick={actions.start}
+                disabled={!isHost(state, me)}
+                title={isHost(state, me) ? '' : 'Матч запускает хост'}
+              >
+                Начать матч
+              </button>
+              {!isHost(state, me) && <p className="hint small">Матч запускает хост 🐄</p>}
+              <p className="hint small">Все отгадывают одно слово одновременно, у каждого своя доска. Угадал раньше — больше очков. Талоны крадут чужую инфу.</p>
             </div>
           )}
 
-          {state.phase === 'draw' && <DrawOverlay state={state} meId={me.id} actions={actions} />}
-          {state.phase === 'pickpos' && <PickPosOverlay state={state} meId={me.id} actions={actions} />}
-          {state.phase === 'smk' && <SmkOverlay state={state} meId={me.id} actions={actions} />}
-
-          {(state.phase === 'round' || state.phase === 'roundEnd') && (
+          {(state.phase === 'round' || state.phase === 'tickEnd' || state.phase === 'roundEnd') && (
             <>
-              <Cow text={cowText} mood={state.round?.winnerId ? 'happy' : 'idle'} />
-              <OrderStrip state={state} nameOf={nameOf} />
-              {isSpectator && state.phase === 'round' && (
-                <div className="spectator-banner">👀 Ты наблюдатель — вступишь в игру, когда кто-то выиграет</div>
-              )}
-              {state.reveals.length > 0 && (
-                <div className="reveals">
-                  {state.reveals.map((rv, i) => (
-                    <span key={i} className="reveal-badge">П{rv.pos + 1}: {rv.letter.toUpperCase()}</span>
-                  ))}
+              <Cow text={cowText} mood={r?.winners.length ? 'happy' : 'idle'} />
+              {r?.event && (
+                <div className="event-banner">
+                  <b>{r.event.title}</b> — {r.event.desc}
                 </div>
               )}
-              <div className="board shared">
-                {state.round.board.map((row, ri) => {
-                  const firstNew = state.round.board.findIndex((x) => !x.old);
-                  return (
-                    <Fragment key={ri}>
-                      {ri === firstNew && firstNew > 0 && <div className="swap-divider">— слово сменили —</div>}
-                      <div className={`row ${row.old ? 'old' : ''}`}>
-                        {[...row.w].map((ch, i) => (
-                          <div key={i} className={`tile reveal s-${row.marks[i]}`} style={{ '--i': i }}>
-                            {ch}
-                          </div>
-                        ))}
-                      </div>
-                    </Fragment>
-                  );
-                })}
-                {state.phase === 'round' && (
-                  myTurn ? (
-                    <div className="row">
-                      {[...Array(5)].map((_, i) => (
-                        <Tile key={i} i={i} ch={cur[i]} active={Boolean(cur[i])} cursor={i === cur.length} />
+              {isSpectator && (state.phase === 'round' || state.phase === 'tickEnd') && (
+                <div className="spectator-banner">👀 Ты наблюдатель — вступишь в игру со следующего слова</div>
+              )}
+              {state.settings.lang === 'en' && (
+                <div className="spectator-banner lang-banner">🇬🇧 Раунд на английском</div>
+              )}
+
+              {/* своя доска: ряды с буквами из приватных данных */}
+              <div className="board">
+                {myRows.map((row, ri) => (
+                  <Fragment key={ri}>
+                    {row.old && (ri === 0 || !myRows[ri - 1].old) && (
+                      <div className="swap-divider">— слово сменили —</div>
+                    )}
+                    <div className={`row ${row.old ? 'old' : ''}`}>
+                      {[...row.w].map((ch, ci) => (
+                        <div key={ci} className={`tile reveal s-${row.marks[ci]}`} style={{ '--i': ci }}>
+                          {ch}
+                        </div>
                       ))}
                     </div>
-                  ) : (
-                    <WaitingRow name={nameOf(state.round.turnId)} />
-                  )
-                )}
+                  </Fragment>
+                ))}
+                {state.phase === 'round' &&
+                  (canSubmit ? (
+                    <div className="row">
+                      {[...Array(wordLen)].map((_, i) => (
+                        <Tile
+                          key={i}
+                          i={i}
+                          ch={cells[i]}
+                          active={Boolean(cells[i])}
+                          cursor={i === cursorPos}
+                          onClick={() => selectCell(i)}
+                        />
+                      ))}
+                    </div>
+                  ) : !done ? (
+                    <div className="wait-row-line">
+                      {submitted ? 'Слово отправлено — ждем остальных…' : 'Ждем закрытия тика…'}
+                    </div>
+                  ) : null)}
               </div>
 
               {state.phase === 'round' && (
                 <>
+                  <div className="tick-status">
+                    {done
+                      ? 'Ты закончил этот раунд'
+                      : submitted
+                        ? 'Слово отправлено — ждем остальных…'
+                        : waiting.length > 0
+                          ? `Ждём: ${waiting.join(', ')}`
+                          : 'Отправляй слово!'}
+                    <TickTimer startedAt={r.tickStartedAt} seconds={state.tickSeconds} soundActive={canSubmit} />
+                  </div>
                   <div className="power-row">
-                    <button className="power-btn" onClick={() => setMenu('check')} disabled={myTokens === 0}>
-                      🤫 Проверить букву (🪙{myTokens})
-                    </button>
-                    <button className="power-btn" onClick={() => setMenu('menu')} disabled={myTokens === 0}>
-                      🧪 Усиления (🪙{myTokens})
+                    <button className="power-btn" onClick={() => setMenu('menu')} disabled={!canSubmit && !canFreePowers(state, me)}>
+                      🧪 Способности (🥛{myTokens})
                     </button>
                   </div>
                   <div className="reactions">
-                    {REACTIONS.map((e) => (
+                    {['🐮', '🥛', '👏', '😏', '🔥'].map((e) => (
                       <button key={e} className="react-btn" onClick={() => actions.react(e)}>{e}</button>
                     ))}
                   </div>
-                  <Keyboard marks={marks} onKey={pressKey} onEnter={pressEnter} onBack={pressBack} disabled={!myTurn} />
+                  <Keyboard
+                    lang={lang}
+                    marks={marks}
+                    knownPos={knownPos}
+                    resetKey={r?.n}
+                    onKey={pressKey}
+                    onEnter={pressEnter}
+                    onBack={pressBack}
+                    disabled={!canSubmit}
+                  />
                 </>
+              )}
+
+              {state.phase === 'tickEnd' && (
+                <div className="panel tick-end">
+                  <h3>Тик {r.tick} закрыт — обдумайте следующий ход</h3>
+                  <p className="hint">Всем раздали ряды. Совещайтесь, считайте талоны, стройте план 🐄</p>
+                  <button className="btn primary" onClick={actions.ready} disabled={iAmReady}>
+                    {iAmReady ? `Готов ✓ (${readyCount}/${aliveCount})` : `Готов (${readyCount}/${aliveCount})`}
+                  </button>
+                  <p className="hint small">Следующий тик нальется, когда все нажмут «Готов» (или через 20 секунд)</p>
+                </div>
               )}
 
               {state.phase === 'roundEnd' && (
                 <div className="overlay">
                   <div className="panel">
-                    <h2>Слово было: {state.round.word?.toUpperCase()}</h2>
-                    <p className="over-line">
-                      Очко забирает <b>{nameOf(state.round.winnerId)}</b> за{' '}
-                      {state.round.board.length} {state.round.board.length === 1 ? 'попытку' : 'попыток'}
-                    </p>
+                    <h2>Слово было: {r.word?.toUpperCase()}</h2>
+                    {r.winners.length > 0 ? (
+                      <p className="over-line">
+                        {r.winners.map(nameOf).join(' и ')}{' '}
+                        {r.winners.length > 1 ? `делят тик ${r.tick} — по ${fmtPts(r.tickShare)}` : `+${fmtPts(r.tickShare)}`} очк.
+                      </p>
+                    ) : (
+                      <p className="over-line">Никто не угадал 😿</p>
+                    )}
+
+                    {r.revealedWords && (
+                      <div className="round-words-reveal">
+                        <div className="power-section">Кто что наливал в раунде:</div>
+                        {state.players
+                          .filter((p) => p.connected && r.revealedWords[p.id]?.length)
+                          .map((p) => (
+                            <div key={p.id} className="reveal-player-row">
+                              <b>{p.name}:</b>{' '}
+                              <span className="peek-words">
+                                {r.revealedWords[p.id].map((w, wi) => (
+                                  <span key={wi} className="peek-word">{w.toUpperCase()}</span>
+                                ))}
+                              </span>
+                            </div>
+                          ))}
+                      </div>
+                    )}
+
                     {isSpectator ? (
-                      <p className="hint">👀 Ты наблюдатель — вступишь в игру со следующего слова</p>
+                      <p className="hint">👀 Ты наблюдатель — вступишь со следующего слова</p>
                     ) : (
                       <button className="btn primary" onClick={actions.ready} disabled={iAmReady}>
-                        {iAmReady ? `Готов ✓ (${readyCount}/${rotationAlive})` : `Готов (${readyCount}/${rotationAlive})`}
+                        {iAmReady ? `Готов ✓ (${readyCount}/${aliveCount})` : `Готов (${readyCount}/${aliveCount})`}
                       </button>
                     )}
-                    <button className="btn ghost" onClick={() => copyResult(state, pushToast)}>
+                    <button className="btn ghost" onClick={() => copyResult(buildResultText(state, myRows), pushToast)}>
                       📋 Скопировать результат
                     </button>
-                    <p className="hint small">Следующее слово нальется, когда все игроки нажмут «Готов»</p>
+                    <p className="hint small">Следующее слово нальется, когда все нажмут «Готов»</p>
                   </div>
                 </div>
               )}
@@ -733,78 +1130,64 @@ export default function PartyGame({ me }) {
           {state.phase === 'matchEnd' && (
             <div className="overlay">
               <div className="panel">
-                <h2>
-                  {state.settings.teamMode
-                    ? state.championTeam === me.team
-                      ? 'Твоя команда — король хлева!'
-                      : 'Матч окончен'
-                    : iAmChampion
-                      ? 'Ты король хлева!'
-                      : 'Матч окончен'}
-                </h2>
+                <h2>{iAmChampion ? 'Ты король хлева!' : 'Матч окончен'}</h2>
                 <Cow
-                  text={line(
-                    state.settings.teamMode
-                      ? state.championTeam === me.team ? 'matchWin' : 'matchLose'
-                      : iAmChampion ? 'matchWin' : 'matchLose',
-                    {},
-                    `champ${state.eventSeq}`,
-                  )}
-                  mood={(!state.settings.teamMode && iAmChampion) || (state.settings.teamMode && state.championTeam === me.team) ? 'happy' : 'sad'}
+                  text={line(iAmChampion ? 'matchWin' : 'matchLose', {}, `champ${state.eventSeq}`)}
+                  mood={iAmChampion ? 'happy' : 'sad'}
                 />
-                {state.settings.teamMode ? (
-                  <div className="podium">
-                    {['egg', 'hen'].map((t) => (
-                      <div className={`podium-row ${state.championTeam === t ? 'winner-team' : ''}`} key={t}>
-                        <span className="team-tag big">{t === 'egg' ? '🥚' : '🐔'}</span>
-                        <b className="podium-pts">{state.teamPoints?.[t] ?? 0}</b>
-                        <span className="podium-name">
-                          {alive(state).filter((p) => p.team === t).map((p) => p.name).join(', ') || '—'}
-                        </span>
-                        {state.championTeam === t && <span>👑</span>}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="podium">
-                    {[...alive(state)]
-                      .sort((a, b) => b.points - a.points)
-                      .map((p, i) => (
-                        <div className="podium-row" key={p.id}>
-                          <span className="podium-place">{i + 1}</span>
-                          <Avatar player={p} />
+                <div className="podium">
+                  {state.players
+                    .filter((p) => p.connected)
+                    .sort((a, b) => b.points - a.points)
+                    .map((p, i) => (
+                      <div className="podium-row" key={p.id}>
+                        <span className="podium-place">{i + 1}</span>
+                        <Avatar player={p} />
+                        <div className="podium-info">
                           <span className="podium-name">{p.name}</span>
-                          {(p.achievements?.length || 0) > 0 && (
-                            <span className="ach-row">
-                              {p.achievements.map((a) => (
-                                <span key={a} className="ach-badge" title={ACH_TITLES[a] || a}>
-                                  {ACH_ICONS[a] || '🏆'}
+                          {p.achievements?.length > 0 && (
+                            <div className="ach-list">
+                              {p.achievements.map((a, ai) => (
+                                <span key={ai} className="ach-pill" title={a.desc}>
+                                  {a.icon} {a.title}
                                 </span>
                               ))}
-                            </span>
+                            </div>
                           )}
-                          <b className="podium-pts">{p.points}</b>
-                          {p.id === state.championId && <span>👑</span>}
                         </div>
-                      ))}
-                  </div>
-                )}
-                <button className="btn primary" onClick={actions.rematch}>Реванш!</button>
+                        <b className="podium-pts">{fmtPts(p.points)}</b>
+                        {p.id === state.championId && <span>👑</span>}
+                      </div>
+                    ))}
+                </div>
+                <button className="btn primary" onClick={actions.rematch} disabled={!isHost(state, me)}>
+                  {isHost(state, me) ? 'Реванш!' : 'Реванш объявит хост'}
+                </button>
               </div>
             </div>
           )}
         </div>
+
+        {(privateData.hints?.length || privateData.peeks?.length || roundLog.length) ? (
+          <HintCards privateData={privateData} roundLog={roundLog} nameOf={nameOf} />
+        ) : null}
       </div>
 
       {menu && state.phase === 'round' && (
-        <PowerOverlay state={state} meId={me.id} menu={menu} setMenu={setMenu} actions={actions} nameOf={nameOf} />
+        <PowerOverlay
+          state={state}
+          meId={me.id}
+          myRows={myRows}
+          menu={menu}
+          setMenu={setMenu}
+          actions={actions}
+        />
       )}
-      {menu === 'check' && state.phase === 'round' && <CheckOverlay setMenu={setMenu} actions={actions} />}
 
       <div className="reaction-layer">
-        {reactions.map((r) => (
-          <span className="reaction-float" key={r.id} style={{ left: `${r.left}%` }}>
-            {r.emoji}
+        {reactions.map((rr) => (
+          <span className="reaction-float" key={rr.id} style={{ left: `${rr.left}%` }}>
+            {rr.emoji}
           </span>
         ))}
       </div>
@@ -814,7 +1197,11 @@ export default function PartyGame({ me }) {
   );
 }
 
-// хост нужен только для настроек лобби (очки до победы)
 function isHost(state, me) {
   return state.hostId === me?.id;
+}
+
+function canFreePowers(state, me) {
+  const r = state.round;
+  return r && !r.submittedIds.includes(me?.id) && !r.doneIds.includes(me?.id);
 }

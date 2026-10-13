@@ -11,7 +11,7 @@ export function shouldParty() {
 }
 
 // Возвращает объект игрока {id, name, avatar} или null (соло-режим в браузере)
-export async function initPlayer() {
+export async function initPlayer(forceParty = false) {
   if (isDiscord) {
     const sdk = new DiscordSDK(import.meta.env.VITE_CLIENT_ID);
     await sdk.ready();
@@ -43,16 +43,20 @@ export async function initPlayer() {
     };
   }
 
-  if (debugParty) {
-    // Мок-игрок для теста комнаты в браузере. sessionStorage — чтобы
+  if (debugParty || forceParty) {
+    // Мок-игрок для комнаты в браузере. sessionStorage — чтобы
     // в соседней вкладке был другой игрок.
     let id = sessionStorage.getItem('moloko-mock-id');
     if (!id) {
       id = `mock-${Math.random().toString(36).slice(2, 8)}`;
       sessionStorage.setItem('moloko-mock-id', id);
     }
-    const names = ['Зорькин Фанат', 'Дояр Сосед', 'Бычок', 'Молочный Магнат', 'Сливкин', 'Пеструха'];
-    const name = names[Math.floor(Math.random() * names.length)];
+    let name = sessionStorage.getItem('moloko-mock-name');
+    if (!name) {
+      const names = ['Зорькин Фанат', 'Дояр Сосед', 'Бычок', 'Молочный Магнат', 'Сливкин', 'Пеструха'];
+      name = '[тест] ' + names[Math.floor(Math.random() * names.length)];
+      sessionStorage.setItem('moloko-mock-name', name);
+    }
     return { id, name, avatar: null };
   }
 

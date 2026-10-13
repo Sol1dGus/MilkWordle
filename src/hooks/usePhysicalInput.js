@@ -11,7 +11,7 @@ const CODE_MAP = {
   KeyM: 'ь', Comma: 'б', Period: 'ю',
 };
 
-export function usePhysicalInput(onLetter, onEnter, onBack) {
+export function usePhysicalInput(onLetter, onEnter, onBack, lang = 'ru', onArrow = null) {
   useEffect(() => {
     const handler = (e) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -23,6 +23,16 @@ export function usePhysicalInput(onLetter, onEnter, onBack) {
         onBack();
         return;
       }
+      if (onArrow && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        e.preventDefault();
+        onArrow(e.key === 'ArrowLeft' ? -1 : 1);
+        return;
+      }
+      if (lang === 'en') {
+        // английская раскладка: латиница напрямую, без CODE_MAP
+        if (/^([a-z])$/i.test(e.key)) onLetter(e.key.toLowerCase());
+        return;
+      }
       if (/^([а-яё])$/i.test(e.key)) {
         onLetter(e.key.toLowerCase().replace('ё', 'е'));
         return;
@@ -31,5 +41,5 @@ export function usePhysicalInput(onLetter, onEnter, onBack) {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [onLetter, onEnter, onBack]);
+  }, [onLetter, onEnter, onBack, lang, onArrow]);
 }
