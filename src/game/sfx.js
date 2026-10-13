@@ -82,4 +82,8 @@ export const sfx = {
     tone(587, { dur: 0.1, type: 'square', vol: 0.09 });
     tone(784, { at: 0.1, dur: 0.18, type: 'square', vol: 0.09 });
   },
+  // тиканье таймера на последних 5 секундах
+  tick(urgent = false) {
+    tone(urgent ? 920 : 680, { dur: 0.05, type: 'sine', vol: urgent ? 0.09 : 0.06 });
+  },
 };
