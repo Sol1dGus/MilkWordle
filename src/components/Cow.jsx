@@ -1,4 +1,4 @@
-// Зорька — флиртующая корова-маскот. SVG целиком свой, никаких картинок.
+// Зорька — корова-маскот нашей фермы. SVG целиком свой, никаких картинок.
 export default function Cow({ text, mood = 'idle' }) {
   const wink = mood === 'wink';
   const happy = mood === 'happy';

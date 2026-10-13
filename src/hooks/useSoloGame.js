@@ -141,8 +141,8 @@ export function useSoloGame(lang = 'ru', wordLen = 5, mode = 'endless') {
       setShake((s) => s + 1);
       pushToast(
         lang === 'en'
-          ? `Type a ${wordLen}-letter word, sweetie`
-          : `Слово из ${wordLen} букв, солнышко`,
+          ? `Enter a ${wordLen}-letter word`
+          : `Нужно слово из ${wordLen} букв`,
       );
       return;
     }
@@ -151,14 +151,14 @@ export function useSoloGame(lang = 'ru', wordLen = 5, mode = 'endless') {
       setShake((s) => s + 1);
       pushToast(
         lang === 'en'
-          ? `Type a ${wordLen}-letter word, sweetie`
-          : `Слово из ${wordLen} букв, солнышко`,
+          ? `Enter a ${wordLen}-letter word`
+          : `Нужно слово из ${wordLen} букв`,
       );
       return;
     }
     if (!isValidWord(word, lang, wordLen)) {
       setShake((s) => s + 1);
-      const l = lang === 'en' ? "I don't know this word, weirdo." : line('invalidWord');
+      const l = lang === 'en' ? 'This word is not in the farm dictionary.' : line('invalidWord');
       pushToast(l);
       setCowText(l);
       return;

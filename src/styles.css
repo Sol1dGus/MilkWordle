@@ -1,4 +1,4 @@
-/* ============ МОЛОКО: коровья раскраска ============ */
+/* ============ MilkWordle: коровья раскраска ============ */
 :root {
   --milk: #f6efe3;
   --panel: #fffdf8;
@@ -63,17 +63,17 @@ body {
 
 .logo {
   font-weight: 900;
-  font-size: 30px;
-  letter-spacing: 3px;
+  font-size: 26px;
+  letter-spacing: 1.5px;
   margin: 0;
-  padding: 2px 18px;
+  padding: 2px 14px;
   background: var(--ink);
   color: var(--milk);
   border-radius: 12px;
   transform: rotate(-2deg);
   box-shadow: 0 4px 0 rgba(25, 20, 16, 0.35);
 }
-.logo.big { font-size: 44px; margin-bottom: 4px; }
+.logo.big { font-size: 40px; margin-bottom: 4px; }
 
 .top-spacer { width: 36px; }
 .icon-btn {
@@ -411,7 +411,7 @@ body {
   width: var(--w, 20%);
 }
 
-/* ---------- сплэш 18+ ---------- */
+/* ---------- сплэш ---------- */
 .splash {
   flex: 1;
   display: flex; align-items: center; justify-content: center;
@@ -839,7 +839,7 @@ body {
 .team-tag.big { font-size: 22px; }
 .winner-team { background: rgba(233, 185, 73, 0.45) !important; }
 
-/* ---------- МОЛОКО 2.0: мини-доски и способности ---------- */
+/* ---------- MilkWordle: мини-доски и способности ---------- */
 .player-list {
   display: flex;
   flex-direction: column;

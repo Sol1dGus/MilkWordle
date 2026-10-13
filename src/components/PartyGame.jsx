@@ -29,7 +29,7 @@ function buildResultText(state, myRows) {
   const r = state.round;
   if (!r) return '';
   const winners = r.winners.map((id) => state.players.find((p) => p.id === id)?.name).filter(Boolean);
-  const lines = [`🥛 МОЛОКО — ${r.word?.toUpperCase()} (тик ${r.tick})`];
+  const lines = [`🥛 MilkWordle — ${r.word?.toUpperCase()} (тик ${r.tick})`];
   lines.push(winners.length ? `🏆 ${winners.join(' + ')}` : '😐 никто не угадал');
   for (const row of myRows) {
     lines.push([...row.marks].map((m) => MARK_EMOJI[m]).join(''));
@@ -329,11 +329,11 @@ function PowerOverlay({ state, meId, myRows, menu, setMenu, actions }) {
               <span>подсмотреть написанные слова соперника — порядок перемешан</span>
             </button>
             <button className="power-item" disabled={!canSpend || me.tokens < 1} onClick={() => setMenu('recon')}>
-              <b>👀 Сексуальная разведка — 1</b>
+              <b>👀 Полевая разведка — 1</b>
               <span>2 случайных слова из базы лягут на твою доску</span>
             </button>
             <button className="power-item" disabled={!canSpend || me.tokens < 2 || targets.length === 0} onClick={() => setMenu('intercept')}>
-              <b>🐄 Белковый перехват — 2</b>
+              <b>🐄 Перехват бидона — 2</b>
               <span>подменить написанное слово противника случайным</span>
             </button>
             <button className="power-item" disabled={!canSpend || me.tokens < 3} onClick={() => setMenu('steal')}>
@@ -422,8 +422,8 @@ function PowerOverlay({ state, meId, myRows, menu, setMenu, actions }) {
     return (
       <div className="overlay" onClick={close}>
         <div className="panel" onClick={(e) => e.stopPropagation()}>
-          <h2>🐄 Белковый перехват</h2>
-          <p className="hint">Чье слово подменить случайным? Жертва узнает.</p>
+          <h2>🐄 Перехват бидона</h2>
+          <p className="hint">Чье слово подменить случайным? Соперник узнает.</p>
           <div className="power-list">
             {targets.map((p) => (
               <button
@@ -442,7 +442,7 @@ function PowerOverlay({ state, meId, myRows, menu, setMenu, actions }) {
     );
   }
 
-  const confirmKind = { recon: ['👀 Сексуальная разведка', '2 случайных слова лягут на твою доску и займут 2 ряда.'], steal: ['🕵️ Деревенская кража', 'Общее слово сменится. Все чужие ряды (и твои) помечаются старыми.'] }[menu];
+  const confirmKind = { recon: ['👀 Полевая разведка', '2 случайных слова лягут на твою доску и займут 2 ряда.'], steal: ['🕵️ Деревенская кража', 'Общее слово сменится. Все чужие ряды (и твои) помечаются старыми.'] }[menu];
   if (confirmKind) {
     return (
       <div className="overlay" onClick={close}>
@@ -491,7 +491,7 @@ function MenuScreen({ me, roomList, connected, actions, muted, setMuted, onSwitc
             </button>
           )}
         </div>
-        <h1 className="logo">МОЛОКО</h1>
+        <h1 className="logo">MilkWordle</h1>
         <button
           className="icon-btn"
           title={muted ? 'Включить звуки' : 'Выключить звуки'}
@@ -500,7 +500,7 @@ function MenuScreen({ me, roomList, connected, actions, muted, setMuted, onSwitc
           {muted ? '🔇' : '🔊'}
         </button>
       </header>
-      <Cow text={me ? `Привет, ${me.name}! Создай комнату для своей группы или заходи к чужим дояркам.` : 'Доим Discord…'} mood="wink" />
+      <Cow text={me ? `Привет, ${me.name}! Создай комнату для друзей или заходи в открытый хлев.` : 'Подключаемся к Discord…'} mood="wink" />
       <input
         className="room-name-input"
         placeholder={`Название комнаты (по умолчанию: Комната ${me.name})`}
@@ -561,7 +561,7 @@ function MenuScreen({ me, roomList, connected, actions, muted, setMuted, onSwitc
         {rooms.length === 0 && <div className="hint">Пока пусто — создай первую комнату или введи код!</div>}
       </div>
       {!connected && <p className="hint">Связываюсь с сервером…</p>}
-      <p className="hint small">Игроки в одной комнате мешают друг другу как хотят. Талоны, шпионаж и доение прилагаются.</p>
+      <p className="hint small">Игроки в одной комнате соревнуются на скорость. Талоны, разведка и веселая ферма прилагаются.</p>
     </div>
   );
 }
@@ -570,7 +570,7 @@ export default function PartyGame({ me, onSwitchSolo }) {
   const { state, connected, inRoom, roomList, toasts, reactions, privateData, clearPrivate, pushToast, actions } = useParty(me);
   const [cells, setCells] = useState(['', '', '', '', '']);
   const [cursorPos, setCursorPos] = useState(0);
-  const [cowText, setCowText] = useState('Приветик… Зорька уже налила. Зови народ!');
+  const [cowText, setCowText] = useState('Добро пожаловать на ферму! Зорька подготовила свежие слова. Зови народ!');
   const [menu, setMenu] = useState(null);
   const [muted, setMuted] = useState(sfx.isMuted());
   const [armed, setArmed] = useState(null);
@@ -718,8 +718,8 @@ export default function PartyGame({ me, onSwitchSolo }) {
     if (cells.length !== wordLen || cells.some((c) => !c)) {
       pushToast(
         lang === 'en'
-          ? `Type a ${wordLen}-letter word, sweetie`
-          : `Слово из ${wordLen} букв, солнышко`,
+          ? `Enter a ${wordLen}-letter word`
+          : `Нужно слово из ${wordLen} букв`,
       );
       return;
     }
@@ -727,8 +727,8 @@ export default function PartyGame({ me, onSwitchSolo }) {
     if (word.length < wordLen) {
       pushToast(
         lang === 'en'
-          ? `Type a ${wordLen}-letter word, sweetie`
-          : `Слово из ${wordLen} букв, солнышко`,
+          ? `Enter a ${wordLen}-letter word`
+          : `Нужно слово из ${wordLen} букв`,
       );
       return;
     }
@@ -741,8 +741,8 @@ export default function PartyGame({ me, onSwitchSolo }) {
   if (!me || !connected) {
     return (
       <div className="game">
-        <h1 className="logo">МОЛОКО</h1>
-        <Cow text={me ? 'Связываюсь с хлевом…' : 'Доим Discord…'} mood="idle" />
+        <h1 className="logo">MilkWordle</h1>
+        <Cow text={me ? 'Связываюсь с хлевом…' : 'Подключаемся к Discord…'} mood="idle" />
       </div>
     );
   }
@@ -764,7 +764,7 @@ export default function PartyGame({ me, onSwitchSolo }) {
   if (!state) {
     return (
       <div className="game">
-        <h1 className="logo">МОЛОКО</h1>
+        <h1 className="logo">MilkWordle</h1>
         <Cow text="Заходим в комнату…" mood="idle" />
       </div>
     );
@@ -790,7 +790,7 @@ export default function PartyGame({ me, onSwitchSolo }) {
               ? `слово №${r.n} · тик ${r.tick}/6`
               : `слово №${r?.n ?? '—'}`}
         </span>
-        <h1 className="logo">МОЛОКО</h1>
+        <h1 className="logo">MilkWordle</h1>
         <button
           className="icon-btn"
           title={muted ? 'Включить звуки' : 'Выключить звуки'}

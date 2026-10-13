@@ -833,7 +833,7 @@ function handlePower(room, ws, msg) {
   if (!spendToken(p, kind, r)) return;
 
   if (kind === 'recon') {
-    // сексуальная разведка: 2 случайных слова на свою доску (доска не ограничена)
+    // полевая разведка: 2 случайных слова на свою доску (доска не ограничена)
     for (let i = 0; i < 2; i++) {
       const w = randomWord(r.lang, r.word.length);
       const marks = evaluateGuess(w, r.word);
@@ -848,7 +848,7 @@ function handlePower(room, ws, msg) {
     r.log.push({ tick: r.tick, type: 'recon', by: ws.playerId });
     sendMyRows(room, ws.playerId);
   } else if (kind === 'intercept') {
-    // белковый перехват: подменяем слово цели в этом тике
+    // перехват бидона: подменяем слово цели в этом тике
     const target = roundPlayer(room, msg.target);
     if (!target || target.id === ws.playerId) {
       p.tokens += POWER_COST[kind]; // возврат
@@ -1306,6 +1306,6 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`🥛 Сервер МОЛОКО 2.0 на порту ${PORT} — комнат: ${rooms.size}`);
+  console.log(`🥛 Сервер MilkWordle на порту ${PORT} — комнат: ${rooms.size}`);
   if (process.env.DEBUG_WORD) console.log(`-debug: слово раунда: ${process.env.DEBUG_WORD}`);
 });

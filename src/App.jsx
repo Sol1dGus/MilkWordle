@@ -2,10 +2,8 @@ import { useEffect, useState } from 'react';
 import { initPlayer, isDiscord, shouldParty } from './discord/discord.js';
 import SoloGame from './components/SoloGame.jsx';
 import PartyGame from './components/PartyGame.jsx';
-import { Splash, Denied } from './components/Splash.jsx';
 
 export default function App() {
-  const [phase, setPhase] = useState(() => (localStorage.getItem('moloko-18') ? 'game' : 'splash'));
   const [me, setMe] = useState(null);
   const [party, setParty] = useState(() => shouldParty());
 
@@ -16,12 +14,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (phase === 'game' && party && !me) {
+    if (party && !me) {
       initPlayer(true)
         .then(setMe)
-        .catch(() => setMe({ id: 'anon', name: 'Анонимная корова', avatar: null }));
+        .catch(() => setMe({ id: 'anon', name: 'Фермер', avatar: null }));
     }
-  }, [phase, party, me]);
+  }, [party, me]);
 
   const switchMode = (toParty) => {
     if (isDiscord) return;
@@ -34,22 +32,11 @@ export default function App() {
 
   return (
     <div className="app">
-      {phase === 'splash' && (
-        <Splash
-          onAccept={() => {
-            localStorage.setItem('moloko-18', '1');
-            setPhase('game');
-          }}
-          onDecline={() => setPhase('denied')}
-        />
+      {party ? (
+        <PartyGame me={me} onSwitchSolo={!isDiscord ? () => switchMode(false) : null} />
+      ) : (
+        <SoloGame onSwitchParty={!isDiscord ? () => switchMode(true) : null} />
       )}
-      {phase === 'denied' && <Denied />}
-      {phase === 'game' &&
-        (party ? (
-          <PartyGame me={me} onSwitchSolo={!isDiscord ? () => switchMode(false) : null} />
-        ) : (
-          <SoloGame onSwitchParty={!isDiscord ? () => switchMode(true) : null} />
-        ))}
     </div>
   );
 }

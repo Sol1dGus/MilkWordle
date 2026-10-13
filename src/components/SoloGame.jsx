@@ -13,7 +13,7 @@ const MARK_EMOJI = { correct: '🟫', present: '🟨', absent: '⬜' };
 function buildSoloResultText(g, mode) {
   const score = g.status === 'won' ? `${g.rows.length}/${g.maxRows}` : `X/${g.maxRows}`;
   const modeLabel = mode === 'daily' ? `Слово дня ${getTodayKey()}` : 'Соло';
-  const lines = [`🥛 МОЛОКО (${modeLabel} · ${g.wordLen} букв) — ${score}`];
+  const lines = [`🥛 MilkWordle (${modeLabel} · ${g.wordLen} букв) — ${score}`];
   for (const row of g.rows) {
     lines.push(row.marks.map((m) => MARK_EMOJI[m]).join(''));
   }
@@ -108,7 +108,7 @@ export default function SoloGame({ onSwitchParty }) {
             {muted ? '🔇' : '🔊'}
           </button>
         </div>
-        <h1 className="logo">МОЛОКО</h1>
+        <h1 className="logo">MilkWordle</h1>
         <div className="top-group">
           <button className="icon-btn" onClick={toggleLang} title="Язык слов">
             {lang === 'ru' ? '🇷🇺' : '🇬🇧'}
@@ -193,7 +193,7 @@ export default function SoloGame({ onSwitchParty }) {
       {modal === 'over' && g.status !== 'playing' && (
         <div className="overlay" onClick={() => setModal(null)}>
           <div className="panel" onClick={(e) => e.stopPropagation()}>
-            <h2>{g.status === 'won' ? 'Зорька в восторге!' : 'Мимо вымени…'}</h2>
+            <h2>{g.status === 'won' ? 'Зорька в восторге!' : 'Мимо бидона…'}</h2>
             <p className="word-reveal">Слово: <b>{g.answer?.toUpperCase()}</b></p>
             <p className="over-line">{g.cowText}</p>
             <StatsGrid stats={g.stats} />
