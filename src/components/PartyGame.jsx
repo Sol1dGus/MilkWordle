@@ -574,6 +574,7 @@ export default function PartyGame({ me, onSwitchSolo }) {
   const [menu, setMenu] = useState(null);
   const [muted, setMuted] = useState(sfx.isMuted());
   const [armed, setArmed] = useState(null);
+  const boardRef = useRef(null);
   const prev = useRef({ myRowsLen: 0, tick: 0, lastSeq: 0, phase: null, roundN: null, winnersLen: -1 });
 
   const r = state?.round;
@@ -667,6 +668,13 @@ export default function PartyGame({ me, onSwitchSolo }) {
     setCells(Array(wordLen).fill(''));
     setCursorPos(0);
   }, [state?.round?.n, state?.round?.tick, wordLen]);
+
+  // автопрокрутка доски вниз при добавлении новых рядов или смене тика
+  useEffect(() => {
+    if (boardRef.current) {
+      boardRef.current.scrollTop = boardRef.current.scrollHeight;
+    }
+  }, [myRows.length, state?.round?.tick, state?.phase]);
 
   // двухшаговое подтверждение кнопок: сброс через 3 секунды
   useEffect(() => {
@@ -997,7 +1005,7 @@ export default function PartyGame({ me, onSwitchSolo }) {
               )}
 
               {/* своя доска: ряды с буквами из приватных данных */}
-              <div className="board">
+              <div className="board" ref={boardRef}>
                 {myRows.map((row, ri) => (
                   <Fragment key={ri}>
                     {row.old && (ri === 0 || !myRows[ri - 1].old) && (

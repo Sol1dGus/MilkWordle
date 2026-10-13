@@ -135,45 +135,49 @@ body {
   60% { transform: rotate(5deg); }
 }
 
-/* ---------- доска и плитки: тянутся под высоту экрана ---------- */
+/* ---------- доска и плитки: единый фиксированный размер + скролл при переполнении ---------- */
 .board {
+  --tile-size: clamp(38px, min(5.4vh, 11.5vw), 50px);
   flex: 1 1 0;
   min-height: 140px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   align-items: center;
-  gap: 0.6vh;
-  padding: 8px 6px;
+  gap: 6px;
+  padding: 10px 8px;
   background: rgba(255, 253, 248, 0.72);
   border: 3px solid var(--ink);
   border-radius: 16px;
   box-shadow: 0 5px 0 rgba(25, 20, 16, 0.8);
-  overflow: hidden;
-}
-.board.shared {
+  overflow-y: auto;
+  overflow-x: hidden;
   scrollbar-width: thin;
   scrollbar-color: var(--brown) transparent;
 }
+.board > :first-child { margin-top: auto; }
+.board > :last-child { margin-bottom: auto; }
+.board::-webkit-scrollbar { width: 6px; height: 6px; }
+.board::-webkit-scrollbar-thumb { background: var(--brown); border-radius: 999px; }
+.board::-webkit-scrollbar-track { background: transparent; }
 
 .row {
-  flex: 1 1 0;
-  min-height: 26px;
-  max-height: 64px;
+  flex: 0 0 var(--tile-size);
+  height: var(--tile-size);
   width: 100%;
   display: flex;
-  gap: 0.8vh;
+  gap: 6px;
   justify-content: center;
 }
 
 .tile {
-  height: 100%;
-  aspect-ratio: 1 / 1;
-  max-width: 64px;
+  width: var(--tile-size);
+  height: var(--tile-size);
+  flex: 0 0 var(--tile-size);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: clamp(14px, 4.2vh, 30px);
+  font-size: calc(var(--tile-size) * 0.52);
   font-weight: 900;
   text-transform: uppercase;
   border: 2.5px solid var(--ink-soft);
