@@ -4,3 +4,4 @@ dist/
 tools/
 data/
 *.log
+.zcode/

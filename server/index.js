@@ -2,75 +2,107 @@ import express from 'express';
 import http from 'http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import {
   consistentWords,
   evaluateGuess,
+  getAnswerList,
   isValidWord,
   normalizeWord,
   pickWord,
+  tickValue,
+  WORD_LENGTHS,
 } from '../src/game/logic.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
-const ROUND_END_DELAY = 45000; // запасной таймер: ждем «Готов» от всех, но не вечно
-const TURN_SECONDS = 60; // время на ход
-const DRAW_SECONDS = 30; // время на выбор яйцо/курица
-const SMK_SECONDS = 20; // время на бросок в СМК
-const PICK_SECONDS = 20; // время на выбор позиции
-const BLOCK_ROUNDS = 3; // порядок ходов живет 3 раунда, потом новый розыгрыш
-const TOKEN_CAP = 2;
+const TICK_SECONDS = Number(process.env.TICK_SECONDS) || 30; // время на ввод слова в тике
+const TICK_OPTIONS = [15, 30, 45];
+const MAX_ATTEMPTS = 6; // рядов на доске у каждого
+const MAX_ROUND_TICKS = 6; // раунд длится ровно 6 тиков
+const TICK_END_FALLBACK = Number(process.env.TICK_END_SECONDS) || 20; // запасной таймер обдумывания
+const ROUND_END_DELAY = 45000; // запасной таймер интерлюдии
+const TOKEN_CAP = 4;
+const TOKEN_START = 2;
+const TOKEN_SKIP_BONUS = 1; // компенсация за пропуск тика по тайм-ауту
+const POINT_OPTIONS = [32, 48, 64, 96];
+const POWER_COST = { cream: 1, sniper: 2, recon: 1, intercept: 2, steal: 3, peek: 2 };
 const REACTIONS = new Set(['🐮', '🥛', '👏', '😏', '🔥']);
-const TOKEN_COST = { reveal: 1, swap: 1, freeze: 1, whisper: 1, check: 1 };
-// Сыр-Молоко-Кувшин: что кого побеждает
-const SMK_BEATS = { cheese: 'milk', milk: 'jug', jug: 'cheese' };
+const LANGS = new Set(['ru', 'en']);
+const WORD_LENS = new Set(WORD_LENGTHS); // 5/6/7 букв
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // без похожих символов
+const MAX_PLAYERS = 8;
 
-// ---------- карьера и ачивки (живут между матчами) ----------
-const CAREER_FILE = path.join(__dirname, '..', 'data', 'career.json');
-const ACHIEVEMENTS = {
-  smkKing: { icon: '🧀', label: 'Сырный король: выиграл 3 молочные битвы' },
-  stakhanovets: { icon: '🥛', label: 'Дояр-стахановец: 5 побед подряд' },
-  iceHeart: { icon: '🧊', label: 'Ледяное сердце: заморозил будущего чемпиона' },
-};
-let career = {};
-try {
-  career = JSON.parse(readFileSync(CAREER_FILE, 'utf8'));
-} catch { /* нет файла — начинаем с нуля */ }
+const BOT_NAMES = [
+  '🤖 Бычок Борька',
+  '🤖 Коза Дереза',
+  '🤖 Баран Толик',
+  '🤖 Хряк Степан',
+  '🤖 Гусь Гаврила',
+  '🤖 Пеструха ИИ',
+];
 
-function saveCareer() {
-  try {
-    mkdirSync(path.dirname(CAREER_FILE), { recursive: true });
-    writeFileSync(CAREER_FILE, JSON.stringify(career, null, 1));
-  } catch (e) {
-    console.error('career save failed:', e.message);
-  }
+const ROUND_EVENTS = [
+  {
+    id: 'double',
+    title: '🌟 Золотой надой',
+    desc: 'Очки за угадывание этого слова удваиваются (×2)!',
+  },
+  {
+    id: 'generous',
+    title: '🥛 Щедрый хлев',
+    desc: 'Зорька угощает: всем игрокам +2 талона на старте раунда!',
+  },
+  {
+    id: 'firstLetter',
+    title: '🔓 Парное молоко',
+    desc: 'Первая буква слова сразу раскрыта всем в приватных знаниях!',
+  },
+];
+
+function emptyStats() {
+  return {
+    fastWins: 0,
+    dirtyPowers: 0,
+    spyPowers: 0,
+    noTokenWins: 0,
+    absentTiles: 0,
+  };
 }
 
-function careerOf(p) {
-  if (!career[p.id]) {
-    career[p.id] = { name: p.name, games: 0, wins: 0, smkWins: 0, winStreak: 0, bestStreak: 0, achievements: [] };
-  }
-  career[p.id].name = p.name;
-  return career[p.id];
-}
+function computeAchievements(room, p) {
+  const s = p.stats || emptyStats();
+  const list = [];
+  const all = [...room.players.values()].filter((x) => x.connected);
+  const maxDirty = Math.max(0, ...all.map((x) => x.stats?.dirtyPowers || 0));
+  const maxSpy = Math.max(0, ...all.map((x) => x.stats?.spyPowers || 0));
+  const maxAbsent = Math.max(0, ...all.map((x) => x.stats?.absentTiles || 0));
 
-function grantAchievement(p, key) {
-  const c = careerOf(p);
-  if (c.achievements.includes(key)) return;
-  c.achievements.push(key);
-  saveCareer();
-  const a = ACHIEVEMENTS[key];
-  for (const client of wss.clients) {
-    if (client.readyState === 1) {
-      client.send(JSON.stringify({ t: 'toast', text: `🏆 ${p.name} получает ачивку ${a.icon} — ${a.label}` }));
-    }
+  if (s.fastWins >= 1) {
+    list.push({ icon: '🎯', title: 'Снайпер дойки', desc: 'Угадал слово за 1–2 тика' });
   }
+  if (s.dirtyPowers >= 1 && s.dirtyPowers === maxDirty) {
+    list.push({ icon: '🐀', title: 'Крыса хлева', desc: `Пакостей: ${s.dirtyPowers}` });
+  }
+  if (s.spyPowers >= 1 && s.spyPowers === maxSpy) {
+    list.push({ icon: '🕵️', title: 'Главный шпион', desc: `Разведок: ${s.spyPowers}` });
+  }
+  if (s.noTokenWins >= 1) {
+    list.push({ icon: '🕶️', title: 'Вслепую', desc: 'Взял раунд без талонов' });
+  }
+  if (s.absentTiles >= 5 && s.absentTiles === maxAbsent) {
+    list.push({ icon: '🪣', title: 'Водовоз', desc: `Серых плиток: ${s.absentTiles}` });
+  }
+  return list;
 }
 
 // ---------- HTTP: обмен OAuth-кода на токен + статика сборки ----------
 const app = express();
 app.use(express.json());
+
+app.get('/api/ping', (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
 app.post('/api/token', async (req, res) => {
   try {
@@ -98,141 +130,175 @@ const dist = path.join(__dirname, '..', 'dist');
 app.use(express.static(dist));
 app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
 
-// ---------- Комната (один голосовой канал = один инстанс активности) ----------
-const room = {
-  phase: 'lobby', // lobby | draw | pickpos | smk | round | roundEnd | matchEnd
-  settings: { pointsToWin: 3, theme: 'all', teamMode: false },
-  hostId: null,
-  players: new Map(), // id -> {id, name, avatar, points, tokens, order, connected, team}
-  round: null, // {n, word, board, order, turnIdx, winnerId}
-  order: null, // текущий порядок ходов [id по позициям]
-  blockStart: null, // номер раунда, с которого действует порядок
-  teams: null, // {egg: [id], hen: [id]} — командный режим
-  teamPoints: { egg: 0, hen: 0 },
-  frozenHistory: [], // {by, target} — для ачивки «Ледяное сердце»
-  draw: null, // { votes: {id: 'egg'|'hen'} }
-  smk: null, // { pool: [id], picks: {id: sym}, dropOrder: [id] }
-  pickQueue: null, // [id] — очередь выбора позиции
-  assigned: null, // {id: pos} — выбранные позиции (0-based)
-  reveals: [], // публично открытые буквы [{pos, letter, by}]
-  frozenId: null, // кто пропускает следующий ход
-  swapCount: 0, // сколько раз меняли слово (клиенты по нему сбрасывают личные подсказки)
-  eventSeq: 0, // счетчик изменений состояния — синхронизация реплик Зорьки
-  turnStartedAt: null, // когда начался текущий ход (для таймера)
-  readySet: new Set(), // кто нажал «Готов» в интерлюдии раунда
-  phaseTimer: null,
-  phaseSeq: 0, // защита от устаревших таймеров фаз
-  hints: new Map(), // id -> [{letter, inWord}] приватные проверки букв
-  whispers: new Map(), // id -> [words] приватный шепот
-  championId: null,
-  roundEndTimer: null,
-};
+// ---------- комнаты ----------
+const rooms = new Map(); // roomId -> room
 let joinCounter = 0;
-let roundCounter = 0;
 
-const connectedPlayers = () =>
-  [...room.players.values()].filter((p) => p.connected).sort((a, b) => a.order - b.order);
+function genRoomCode() {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let code = '';
+    for (let i = 0; i < 4; i++) {
+      code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    }
+    if (![...rooms.values()].some((r) => r.id === code)) return code;
+  }
+  return 'R' + Date.now().toString(36).toUpperCase().slice(-4);
+}
 
-const addToken = (p) => {
-  p.tokens = Math.min(TOKEN_CAP, p.tokens + 1);
-};
+function newRoom(name, visibility, isPrivate = false) {
+  const room = {
+    id: genRoomCode(),
+    name: String(name || '').slice(0, 30) || 'Комната без названия',
+    isPrivate: Boolean(isPrivate),
+    phase: 'lobby', // lobby | round | tickEnd | roundEnd | matchEnd
+    // open: противники видят буквы в мини-досках; closed: только цвета
+    settings: {
+      pointsToWin: 48,
+      lang: 'ru',
+      wordLength: 5,
+      visibility: visibility === 'open' ? 'open' : 'closed',
+      tickSeconds: TICK_SECONDS,
+      eventsEnabled: !process.env.TEST_TOKEN_GRANT && !process.env.DEBUG_WORD,
+    },
+    hostId: null,
+    players: new Map(), // id -> {id, name, avatar, tokens, points, order, connected, isBot, stats}
+    round: null,
+    eventSeq: 0,
+    readySet: new Set(),
+    phaseTimer: null,
+    botTimers: [],
+    phaseSeq: 0,
+    roundEndTimer: null,
+    privateHints: new Map(),
+    lastEvent: null,
+    championId: null,
+    deleteTimer: null,
+    createdAt: Date.now(),
+  };
+  rooms.set(room.id, room);
+  return room;
+}
 
-// ---------- сериализация ----------
-function serialize() {
+function humanPlayers(room) {
+  return [...room.players.values()].filter((p) => p.connected && !p.isBot);
+}
+
+function deleteRoomIfEmpty(room) {
+  if (humanPlayers(room).length > 0) return false;
+  clearPhaseTimer(room);
+  clearTimeout(room.roundEndTimer);
+  rooms.delete(room.id);
+  broadcastRoomList();
+  return true;
+}
+
+function roomOf(ws) {
+  return ws.roomId ? rooms.get(ws.roomId) || null : null;
+}
+
+function serializeRoomList() {
+  return [...rooms.values()]
+    .filter((r) => !r.isPrivate)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((r) => ({
+      id: r.id,
+      name: r.name,
+      host: r.players.get(r.hostId)?.name || '—',
+      players: [...r.players.values()].filter((p) => p.connected).length,
+      phase: r.phase,
+      lang: r.settings.lang,
+      visibility: r.settings.visibility,
+    }));
+}
+
+function broadcastRoomList() {
+  const msg = JSON.stringify({ t: 'roomList', rooms: serializeRoomList() });
+  for (const client of wss.clients) {
+    if (client.readyState === 1) client.send(msg);
+  }
+}
+
+// ---------- сериализация состояния комнаты ----------
+// ВАЖНО: публичные доски уходят БЕЗ букв — противники видят только цветовой
+// прогресс. Свои буквы каждый получает приватным сообщением.
+function serialize(room) {
   const r = room.round;
+  const tickSec = room.settings.tickSeconds || TICK_SECONDS;
   const base = {
     phase: room.phase,
+    roomId: room.id,
+    roomName: room.name,
+    isPrivate: Boolean(room.isPrivate),
     settings: room.settings,
     hostId: room.hostId,
     eventSeq: room.eventSeq,
-    turnSeconds: TURN_SECONDS,
-    teamPoints: room.teamPoints,
+    tickSeconds: tickSec,
+    maxAttempts: MAX_ATTEMPTS,
+    lastEvent: room.lastEvent,
+    championId: room.championId,
     players: [...room.players.values()]
       .sort((a, b) => a.order - b.order)
       .map((p) => ({
         id: p.id,
         name: p.name,
         avatar: p.avatar,
-        points: p.points,
+        isBot: Boolean(p.isBot),
+        difficulty: p.difficulty || 'normal',
+        points: Math.round(p.points * 100) / 100,
         tokens: p.tokens,
         connected: p.connected,
-        team: p.team || null,
-        achievements: career[p.id]?.achievements || [],
+        achievements: room.phase === 'matchEnd' ? computeAchievements(room, p) : [],
       })),
-    order: room.order,
-    frozenId: room.frozenId,
-    reveals: room.reveals,
-    swapCount: room.swapCount,
-    championId: room.championId,
-    championTeam: room.championTeam || null,
     round: null,
   };
 
-  // розыгрыш: выборы скрыты, показываем только кто уже проголосовал
-  if (room.phase === 'draw' && room.draw) {
-    base.draw = { voted: Object.keys(room.draw.votes), seconds: DRAW_SECONDS };
-  }
-  if (room.phase === 'smk' && room.smk) {
-    base.smk = {
-      pool: room.smk.pool,
-      pairs: room.smk.pairs,
-      bye: room.smk.bye,
-      drops: [...room.smk.dropOrder],
-      seconds: SMK_SECONDS,
-    };
-  }
-  if (room.phase === 'pickpos' && room.pickQueue) {
-    const taken = new Set(Object.values(room.assigned || {}));
-    const total = Object.keys(room.draw?.votes || {}).length || room.players.size;
-    base.pick = {
-      pickerId: room.pickQueue[0],
-      freePositions: [...Array(total).keys()].filter((i) => !taken.has(i)),
-      seconds: PICK_SECONDS,
-    };
-  }
-  if (room.phase === 'roundEnd') {
-    base.ready = [...room.readySet];
-  }
-
   if (r) {
+    const boards = {};
+    // открытый режим: чужие мини-доски уходят с буквами, закрытый — только цвета
+    const showLetters = room.settings.visibility === 'open';
+    for (const [id, rows] of Object.entries(r.boards)) {
+      boards[id] = rows.map((row) => ({ marks: row.marks, old: row.old || false, ...(showLetters ? { w: row.w } : {}) }));
+    }
+    const revealedWords =
+      room.phase === 'roundEnd' || room.phase === 'matchEnd'
+        ? Object.fromEntries(
+            Object.entries(r.boards).map(([id, rows]) => [id, rows.map((row) => row.w)]),
+          )
+        : null;
     base.round = {
       n: r.n,
-      board: r.board,
-      order: r.order,
-      turnId: r.order[r.turnIdx] ?? null,
-      winnerId: r.winnerId,
-      // во время раунда слово скрыто даже от клиентов
+      lang: r.lang,
+      tick: r.tick,
+      wordLength: r.word.length,
+      tickStartedAt: r.tickStartedAt,
+      tickShare: r.tickShare ?? null,
+      event: r.event || null,
+      log: r.log || [],
+      boards,
+      revealedWords,
+      submittedIds: Object.keys(r.submissions),
+      doneIds: Object.keys(r.done),
+      winners: r.winners,
       word: room.phase === 'round' ? null : r.word,
-      starterId: r.order[(r.n - room.blockStart) % r.order.length] ?? null,
-      nextStarters: nextStarters(),
-      turnStartedAt: room.turnStartedAt,
     };
+  }
+  if (room.phase === 'roundEnd' || room.phase === 'tickEnd') {
+    base.ready = [...room.readySet];
   }
   return base;
 }
 
-// кто будет стартовать в текущем блоке раундов (для полоски порядка)
-function nextStarters() {
-  if (!room.order || room.blockStart == null) return [];
-  return [...Array(BLOCK_ROUNDS).keys()].map((i) => {
-    const rn = room.blockStart + i;
-    const round = room.round;
-    if (round && rn < round.n) return null; // уже сыгранные
-    return room.order[(rn - room.blockStart) % room.order.length] ?? null;
-  });
-}
-
-function broadcast() {
+function broadcast(room) {
   room.eventSeq += 1;
   let msg;
   try {
-    msg = JSON.stringify({ t: 'state', state: serialize() });
+    msg = JSON.stringify({ t: 'state', state: serialize(room) });
   } catch (e) {
     console.error('[broadcast serialize error]', e);
     return;
   }
   for (const client of wss.clients) {
-    if (client.readyState === 1) client.send(msg);
+    if (client.readyState === 1 && client.roomId === room.id) client.send(msg);
   }
 }
 
@@ -244,650 +310,646 @@ function sendPrivate(ws, data) {
   if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'private', data }));
 }
 
-// ---------- таймеры фаз: афк-игрок не блокирует игру ----------
-function clearPhaseTimer() {
-  room.phaseSeq += 1;
-  clearTimeout(room.phaseTimer);
-  room.phaseTimer = null;
-}
-
-function schedulePhase(seconds, fn) {
-  clearPhaseTimer();
-  const seq = room.phaseSeq;
-  room.phaseTimer = setTimeout(() => {
-    if (seq === room.phaseSeq) fn();
-  }, seconds * 1000);
-}
-
-// таймер хода: время вышло — ход переходит дальше
-function startTurnTimer() {
-  room.turnStartedAt = Date.now();
-  schedulePhase(TURN_SECONDS, () => {
-    if (room.phase !== 'round' || !room.round) return;
-    const skipName = room.players.get(room.round.order[room.round.turnIdx])?.name || 'кто-то';
-    for (const client of wss.clients) {
-      if (client.readyState === 1) {
-        client.send(JSON.stringify({ t: 'toast', text: `⏰ Время вышло — ${skipName} думал слишком долго` }));
-      }
-    }
-    advanceTurn();
-    startTurnTimer();
-    broadcast();
-  });
-}
-
-// случайный элемент, который еще не выбрал сам
-function randomPick(ids, pickedMap) {
-  const candidates = ids.filter((id) => !pickedMap[id]);
-  return candidates[Math.floor(Math.random() * candidates.length)];
-}
-
-// ---------- раунды и блоки порядка ----------
-function newRound() {
-  roundCounter += 1;
-  // наблюдатели прошлого раунда вступают в игру: дописываем их в конец очереди
-  const newcomers = connectedPlayers()
-    .filter((p) => !room.order.includes(p.id))
-    .map((p) => p.id);
-  if (room.settings.teamMode && room.teams) {
-    // новичок команды — в меньшую команду
-    for (const id of newcomers) {
-      const p = room.players.get(id);
-      const team = room.teamPoints.egg <= room.teamPoints.hen ? 'egg' : 'hen';
-      p.team = team;
-      room.teams[team].push(id);
-    }
-  }
-  room.order.push(...newcomers);
-  const order = [...room.order];
-  room.round = {
-    n: roundCounter,
-    word: process.env.DEBUG_WORD || pickWord(room.settings.theme),
-    board: [],
-    order,
-    // стартующий сдвигается каждый раунд внутри блока
-    turnIdx: (roundCounter - room.blockStart) % order.length,
-    winnerId: null,
-  };
-  room.reveals = [];
-  room.frozenId = null;
-  room.hints.clear();
-  room.whispers.clear();
-  room.phase = 'round';
-  startTurnTimer();
-  broadcast();
-}
-
-// нужен ли новый розыгрыш порядка перед раундом n
-function needDraw(n) {
-  return room.order == null || (n - room.blockStart) % BLOCK_ROUNDS === 0;
-}
-
-function startMatch() {
-  clearPhaseTimer();
-  for (const p of room.players.values()) {
-    p.points = 0;
-    p.tokens = 1; // гибрид: стартовый жетон каждому
-    p.team = null;
-    const c = careerOf(p);
-    c.games += 1;
-  }
-  saveCareer();
-  room.championId = null;
-  room.championTeam = null;
-  room.teamPoints = { egg: 0, hen: 0 };
-  room.frozenHistory = [];
-  room.teams = null;
-  roundCounter = 0;
-  room.order = null;
-  startDraw();
-}
-
-function startDraw() {
-  clearPhaseTimer();
-  // двоим Яйцо-Курица не нужно — сразу бьются в СМК
-  const ids = connectedPlayers().map((p) => p.id);
-  if (ids.length <= 2) {
-    startSmk(ids);
-    return;
-  }
-  room.phase = 'draw';
-  room.draw = { votes: {} };
-  room.smk = null;
-  room.pickQueue = null;
-  room.assigned = {};
-  // если кто-то задумался над яйцом — выберем за него
-  schedulePhase(DRAW_SECONDS, () => {
-    if (room.phase !== 'draw') return;
-    for (const id of ids) {
-      if (!room.draw.votes[id]) room.draw.votes[id] = Math.random() < 0.5 ? 'egg' : 'hen';
-    }
-    resolveDraw();
-    broadcast();
-  });
-  broadcast();
-}
-
-function startSmk(pool) {
-  clearPhaseTimer();
-  room.phase = 'smk';
-  room.assigned = room.assigned || {};
-  room.smk = { pool: [...pool], picks: {}, dropOrder: [], pairs: [], bye: null };
-  pairUp();
-  broadcast();
-}
-
-// разбиваем пул на пары (перемешанно); нечетный проходит дальше без боя
-function pairUp() {
-  const pool = [...room.smk.pool];
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pool[i], pool[j]] = [pool[j], pool[i]];
-  }
-  room.smk.pairs = [];
-  room.smk.picks = {};
-  room.smk.bye = null;
-  while (pool.length >= 2) room.smk.pairs.push([pool.shift(), pool.shift()]);
-  if (pool.length === 1) room.smk.bye = pool[0];
-  schedulePhase(SMK_SECONDS, () => {
-    if (room.phase !== 'smk') return;
-    const inPair = room.smk.pairs.flat();
-    for (const id of inPair) {
-      if (!room.smk.picks[id]) {
-        const syms = Object.keys(SMK_BEATS);
-        room.smk.picks[id] = syms[Math.floor(Math.random() * syms.length)];
-      }
-    }
-    resolveSmkRound();
-    broadcast();
-  });
-  broadcast();
-}
-
-// розыгрыш завершен: собираем порядок из выбранных позиций
-function finishDraw() {
-  room.order = [];
-  for (const [id, pos] of Object.entries(room.assigned)) {
-    room.order[pos] = id;
-  }
-  room.blockStart = roundCounter + 1;
-  room.draw = null;
-  room.smk = null;
-  room.pickQueue = null;
-  room.assigned = null;
-  newRound();
-}
-
-function resolveDraw() {
-  const ids = connectedPlayers().map((p) => p.id);
-  const eggs = ids.filter((id) => room.draw.votes[id] === 'egg');
-  const hens = ids.filter((id) => room.draw.votes[id] === 'hen');
-
-  // командный режим: яйцо против курицы — команды, без разбора мест
-  if (room.settings.teamMode) {
-    if (Math.abs(eggs.length - hens.length) > 1) {
-      startDraw(); // команды не ровные — голосуем заново
-      for (const client of wss.clients) {
-        if (client.readyState === 1) client.send(JSON.stringify({ t: 'toast', text: 'Команды вышли неровными — голосуем заново!' }));
-      }
-      return;
-    }
-    room.teams = { egg: eggs, hen: hens };
-    for (const p of room.players.values()) {
-      p.team = eggs.includes(p.id) ? 'egg' : hens.includes(p.id) ? 'hen' : null;
-    }
-    startSmk(ids); // парный турнир определит чередование ходов
-    return;
-  }
-
-  let minority;
-  let majority;
-  if (eggs.length === hens.length || eggs.length === 0 || hens.length === 0) {
-    minority = [];
-    majority = ids;
-  } else if (eggs.length < hens.length) {
-    minority = eggs;
-    majority = hens;
-  } else {
-    minority = hens;
-    majority = eggs;
-  }
-
-  room.assigned = {};
-  if (majority.length >= 2) {
-    // меньшинство выбирает позиции первым, потом СМК за право выбора остальных
-    room.pickQueue = [...minority];
-    room.smk = { pool: [...majority], picks: {}, dropOrder: [], pending: true };
-    room.phase = 'pickpos';
-    if (minority.length === 0) {
-      startSmk(majority); // ничья или все выбрали одинаково — СМК для всех
-      return;
-    }
-    schedulePickTimer();
-  } else {
-    // 1-2 игрока: просто выбираем позиции по очереди
-    room.pickQueue = [...minority, ...majority];
-    room.phase = 'pickpos';
-    schedulePickTimer();
-  }
-  broadcast();
-}
-
-// разбираем все пары текущего тура; ничья в паре — переигровка
-function resolveSmkRound() {
-  const { pairs, picks, dropOrder, bye } = room.smk;
-  const next = bye ? [bye] : [];
-  const losers = [];
-  for (const [a, b] of pairs) {
-    const sa = picks[a];
-    const sb = picks[b];
-    if (!sa || !sb || sa === sb) {
-      next.push(a, b); // кто-то не выбрал или ничья — пара играет заново
-      continue;
-    }
-    if (SMK_BEATS[sa] === sb) {
-      next.push(a);
-      losers.push(b);
-    } else {
-      next.push(b);
-      losers.push(a);
-    }
-  }
-  dropOrder.push(...losers);
-
-  if (next.length === 1) {
-    // чемпион СМК определен — ачивка «Сырный король»
-    const champ = room.players.get(next[0]);
-    if (champ) {
-      const c = careerOf(champ);
-      c.smkWins += 1;
-      if (c.smkWins >= 3) grantAchievement(champ, 'smkKing');
-      saveCareer();
-    }
-
-    if (room.settings.teamMode) {
-      // команды чередуются в очереди: лучший из яйца, лучший из курицы, …
-      const rank = [next[0], ...[...dropOrder].reverse()];
-      const egg = rank.filter((id) => room.teams?.egg.includes(id));
-      const hen = rank.filter((id) => room.teams?.hen.includes(id));
-      const order = [];
-      while (egg.length || hen.length) {
-        if (egg.length) order.push(egg.shift());
-        if (hen.length) order.push(hen.shift());
-      }
-      room.order = order;
-      room.blockStart = roundCounter + 1;
-      room.smk = null;
-      newRound();
-      return;
-    }
-
-    room.pickQueue = [next[0], ...[...dropOrder].reverse()];
-    room.phase = 'pickpos';
-    room.smk = null;
-    schedulePickTimer();
-  } else {
-    room.smk.pool = next;
-    pairUp();
-  }
-  broadcast();
-}
-
-// таймер на выбор позиции текущим игроком
-function schedulePickTimer() {
-  clearPhaseTimer();
-  schedulePhase(PICK_SECONDS, () => {
-    if (room.phase !== 'pickpos' || !room.pickQueue?.length) return;
-    const picker = room.pickQueue[0];
-    const taken = new Set(Object.values(room.assigned || {}));
-    const total = Object.keys(room.draw?.votes || {}).length || room.players.size;
-    const free = [...Array(total).keys()].filter((i) => !taken.has(i));
-    if (free.length === 0) {
-      finishDraw();
-      return;
-    }
-    room.assigned[picker] = free[Math.floor(Math.random() * free.length)];
-    room.pickQueue.shift();
-    const pName = room.players.get(picker)?.name || 'кто-то';
-    for (const client of wss.clients) {
-      if (client.readyState === 1) {
-        client.send(JSON.stringify({ t: 'toast', text: `⏰ ${pName} медлил — Зорька выбрала место за него` }));
-      }
-    }
-    if (room.pickQueue.length === 0) {
-      if (room.smk && room.smk.pending) {
-        startSmk(room.smk.pool);
-        return;
-      }
-      finishDraw();
-      return;
-    }
-    schedulePickTimer();
-    broadcast();
-  });
-}
-
-function pickPositionsDone() {
-  return Object.keys(room.assigned).length >= room.players.size;
-}
-
-function nextRound() {
-  clearTimeout(room.roundEndTimer);
-  room.roundEndTimer = null;
-  const champion = [...room.players.values()].find(
-    (p) => p.points >= room.settings.pointsToWin,
-  );
-  const championTeam = room.settings.teamMode
-    ? ['egg', 'hen'].find((t) => room.teamPoints[t] >= room.settings.pointsToWin)
-    : null;
-  if (champion || championTeam) {
-    room.phase = 'matchEnd';
-    if (champion) {
-      room.championId = champion.id;
-      const c = careerOf(champion);
-      c.wins += 1;
-      saveCareer();
-    }
-    if (championTeam) room.championTeam = championTeam;
-    // «Ледяное сердце»: заморозил того, кто стал чемпионом
-    for (const f of room.frozenHistory) {
-      const champId = champion ? champion.id : room.championTeam
-        ? [...room.players.values()].find((p) => p.team === room.championTeam)?.id
-        : null;
-      if (f.target === champId) {
-        const freezer = room.players.get(f.by);
-        if (freezer) grantAchievement(freezer, 'iceHeart');
-      }
-    }
-    broadcast();
-    return;
-  }
-  const nextN = roundCounter + 1;
-  if (needDraw(nextN)) {
-    startDraw();
-  } else {
-    newRound();
-  }
-}
-
-// ---------- ходы и усиления ----------
-function advanceTurn() {
-  const r = room.round;
-  for (let i = 1; i <= r.order.length; i++) {
-    const idx = (r.turnIdx + i) % r.order.length;
-    const p = room.players.get(r.order[idx]);
-    if (!p || !p.connected) continue;
-    if (room.frozenId === p.id) {
-      room.frozenId = null;
-      sendToPlayer(p.id, 'Молоко скисло — пропускаешь ход 🧊');
-      continue;
-    }
-    r.turnIdx = idx;
-    startTurnTimer();
-    return;
-  }
-}
-
-function sendToPlayer(playerId, text) {
+function sendToPlayer(room, playerId, text) {
   for (const client of wss.clients) {
-    if (client.readyState === 1 && client.playerId === playerId) {
+    if (client.readyState === 1 && client.roomId === room.id && client.playerId === playerId) {
       client.send(JSON.stringify({ t: 'toast', text }));
     }
   }
 }
 
-function spendToken(p, kind, ws) {
-  if (p.tokens < TOKEN_COST[kind]) {
-    sendTo(ws, 'Жетонов нет — работай мозгами 🐮');
+// приватное сообщение игроку: его доска с буквами + его подсказки
+function sendMyRows(room, playerId) {
+  const r = room.round;
+  if (!r) return;
+  for (const client of wss.clients) {
+    if (client.readyState === 1 && client.roomId === room.id && client.playerId === playerId) {
+      sendPrivate(client, {
+        myRows: r.boards[playerId] || [],
+        hints: room.privateHints.get(playerId) || [],
+      });
+    }
+  }
+}
+
+// ---------- таймеры фаз ----------
+function clearBotTimers(room) {
+  if (room.botTimers) {
+    for (const t of room.botTimers) clearTimeout(t);
+    room.botTimers = [];
+  }
+}
+
+function clearPhaseTimer(room) {
+  room.phaseSeq += 1;
+  clearTimeout(room.phaseTimer);
+  room.phaseTimer = null;
+  clearBotTimers(room);
+}
+
+function schedulePhase(room, seconds, fn) {
+  clearPhaseTimer(room);
+  const seq = room.phaseSeq;
+  room.phaseTimer = setTimeout(() => {
+    if (seq === room.phaseSeq && rooms.get(room.id) === room) fn();
+  }, seconds * 1000);
+}
+
+// таймер тика: не отправил — пропуск попытки + талон-компенсация
+function startTickTimer(room) {
+  room.round.tickStartedAt = Date.now();
+  const tickSec = room.settings.tickSeconds || TICK_SECONDS;
+  schedulePhase(room, tickSec, () => {
+    if (room.phase !== 'round' || !room.round) return;
+    for (const id of activeIds(room)) {
+      if (!room.round.submissions[id]) {
+        const p = room.players.get(id);
+        addToken(p, TOKEN_SKIP_BONUS);
+        room.lastEvent = { seq: room.eventSeq + 1, type: 'skip', by: id };
+        room.round.log.push({ tick: room.round.tick, type: 'skip', by: id });
+        sendToPlayer(room, id, `⏰ Время вышло — попытка пропущена, +${TOKEN_SKIP_BONUS} талон 🥛`);
+      }
+    }
+    resolveTick(room);
+  });
+  scheduleBotActions(room);
+}
+
+// случайное слово из базы текущего языка и длины
+function randomWord(lang, length) {
+  return pickWord(lang, length);
+}
+
+// ---------- игроки комнаты ----------
+function connectedPlayers(room) {
+  return [...room.players.values()].filter((p) => p.connected).sort((a, b) => a.order - b.order);
+}
+
+// игрок, участвующий в текущем раунде (у него есть доска и он не угадал)
+function roundPlayer(room, id) {
+  return room.round && room.round.boards[id] && !room.round.done[id]
+    ? room.players.get(id)
+    : null;
+}
+
+// доска игрока заполнена — он выпадает из тиков до конца раунда
+function activeIds(room) {
+  return connectedPlayers(room)
+    .filter((p) => roundPlayer(room, p.id))
+    .map((p) => p.id);
+}
+
+const addToken = (p, n = 1) => {
+  p.tokens = Math.min(TOKEN_CAP, p.tokens + n);
+};
+
+function autoReadyBots(room) {
+  for (const p of connectedPlayers(room)) {
+    if (p.isBot) room.readySet.add(p.id);
+  }
+}
+
+function scheduleBotActions(room) {
+  clearBotTimers(room);
+  const r = room.round;
+  if (!r || room.phase !== 'round') return;
+  const tickSec = room.settings.tickSeconds || TICK_SECONDS;
+  const bots = connectedPlayers(room).filter((p) => p.isBot && roundPlayer(room, p.id));
+
+  for (const bot of bots) {
+    const diff = bot.difficulty || 'normal'; // 'easy' | 'normal' | 'hard'
+    const baseDelay = Math.min(2000, Math.max(350, tickSec * 220));
+    const delay = baseDelay + Math.floor(Math.random() * 650);
+    const timer = setTimeout(() => {
+      if (room.phase !== 'round' || room.round !== r) return;
+      if (r.submissions[bot.id] !== undefined || r.done[bot.id]) return;
+
+      // ИИ-способности для Дояра (normal) и Кибер-коровы (hard)
+      if (diff !== 'easy' && r.tick >= 2) {
+        // Кибер-корова может перехватить ход лидера по очкам
+        if (diff === 'hard' && bot.tokens >= POWER_COST.intercept && Math.random() < 0.35) {
+          const rivals = connectedPlayers(room)
+            .filter((p) => p.id !== bot.id && roundPlayer(room, p.id))
+            .sort((a, b) => b.points - a.points);
+          const leader = rivals[0];
+          if (leader && (leader.points >= bot.points || (r.boards[leader.id]?.length ?? 0) >= 2)) {
+            if (spendToken(bot, 'intercept', r)) {
+              const w = randomWord(r.lang, r.word.length);
+              r.submissions[leader.id] = { w };
+              sendToPlayer(room, leader.id, `🐄 ${bot.name} перехватил твою попытку — отправлено случайное слово!`);
+              r.submissions[bot.id] = { w: null };
+              room.lastEvent = { seq: room.eventSeq + 1, type: 'intercept', by: bot.id, target: leader.id };
+              r.log.push({ tick: r.tick, type: 'intercept', by: bot.id, target: leader.id });
+              if (allSubmitted(room)) resolveTick(room);
+              else broadcast(room);
+              return;
+            }
+          }
+        }
+
+        // Разведка букв через «Первые сливки» (не тратит ход)
+        const creamChance = diff === 'hard' ? 0.55 : 0.22;
+        if (bot.tokens >= POWER_COST.cream && Math.random() < creamChance) {
+          const hints = room.privateHints.get(bot.id) || [];
+          const knownLetters = new Set([
+            ...hints.map((h) => h.letter),
+            ...(r.boards[bot.id] || []).flatMap((row) => [...row.w]),
+          ]);
+          const alphabet = r.lang === 'en' ? 'etaoinshrdlcumwfgypbvkjxqz' : 'оеаинтсрвлкмдпуяыьгзбчйхжшюцщэCфъ';
+          const probe = [...alphabet].find((ch) => !knownLetters.has(ch));
+          if (probe && spendToken(bot, 'cream', r)) {
+            hints.push({ letter: probe, inWord: r.word.includes(probe) });
+            room.privateHints.set(bot.id, hints);
+            room.lastEvent = { seq: room.eventSeq + 1, type: 'cream', by: bot.id };
+            r.log.push({ tick: r.tick, type: 'cream', by: bot.id });
+          }
+        }
+      }
+
+      const myRows = r.boards[bot.id] || [];
+      const myHints = room.privateHints.get(bot.id) || [];
+      const used = new Set(myRows.map((row) => row.w));
+      const allAnswers = getAnswerList(r.lang, r.word.length);
+
+      const accuracy = diff === 'hard' ? 0.96 : diff === 'easy' ? 0.35 : 0.78;
+      const safeTicks = diff === 'hard' ? 1 : diff === 'easy' ? 3 : 2;
+
+      let chosen = null;
+      if (myRows.length === 0 && myHints.length === 0) {
+        // Первый тик: случайное стартовое слово (не угадываем с 1-го тика вслепую)
+        const pool = allAnswers.filter((w) => w !== r.word);
+        chosen = (pool.length ? pool : allAnswers)[Math.floor(Math.random() * (pool.length || allAnswers.length))];
+      } else {
+        const candidates = consistentWords(myRows, myHints, used, r.lang, r.word.length);
+        if (candidates.length > 0 && Math.random() < accuracy) {
+          const nonWin = candidates.filter((w) => w !== r.word);
+          const pickPool = r.tick <= safeTicks && nonWin.length > 0 ? nonWin : candidates;
+          chosen = pickPool[Math.floor(Math.random() * pickPool.length)];
+        } else {
+          const fallback = allAnswers.filter((w) => !used.has(w) && w !== r.word);
+          const pool = fallback.length ? fallback : allAnswers;
+          chosen = pool[Math.floor(Math.random() * pool.length)];
+        }
+      }
+
+      if (!chosen) chosen = r.word;
+      r.submissions[bot.id] = { w: chosen };
+      if (allSubmitted(room)) resolveTick(room);
+      else broadcast(room);
+    }, delay);
+    room.botTimers.push(timer);
+  }
+}
+
+// ---------- раунды и тики ----------
+function startRound(room) {
+  room.roundCounter = (room.roundCounter || 0) + 1;
+  const players = connectedPlayers(room);
+  const boards = {};
+  for (const p of players) boards[p.id] = [];
+
+  const word = process.env.DEBUG_WORD || pickWord(room.settings.lang, room.settings.wordLength);
+  let event = null;
+  if (room.settings.eventsEnabled && room.roundCounter >= 2) {
+    event = ROUND_EVENTS[Math.floor(Math.random() * ROUND_EVENTS.length)];
+  }
+
+  room.privateHints.clear();
+  if (event?.id === 'generous') {
+    for (const p of players) addToken(p, 2);
+  } else if (event?.id === 'firstLetter') {
+    for (const p of players) {
+      room.privateHints.set(p.id, [{ type: 'pos', letter: word[0], pos: 0, atPos: true }]);
+    }
+  }
+
+  const initialLog = [];
+  if (event) {
+    initialLog.push({ tick: 1, type: 'roundEvent', title: event.title });
+  }
+
+  room.round = {
+    n: room.roundCounter,
+    word,
+    lang: room.settings.lang,
+    tick: 1,
+    tickStartedAt: null,
+    event,
+    log: initialLog,
+    submissions: {}, // id -> {w: слово | null = попытка потрачена на способность}
+    tokensSpent: {},
+    boards,
+    done: {}, // id -> 'guessed'
+    winners: [],
+    pendingSteal: false,
+  };
+  if (event) {
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'roundEvent', eventId: event.id };
+  }
+  room.readySet = new Set();
+  room.phase = 'round';
+  startTickTimer(room);
+  broadcast(room);
+  for (const p of players) sendMyRows(room, p.id);
+}
+
+function startMatch(room) {
+  clearPhaseTimer(room);
+  clearTimeout(room.roundEndTimer);
+  room.roundEndTimer = null;
+  for (const p of room.players.values()) {
+    p.points = 0;
+    p.tokens = p.testGrant ? TOKEN_CAP : TOKEN_START;
+    p.stats = emptyStats();
+  }
+  room.championId = null;
+  room.roundCounter = 0;
+  startRound(room);
+}
+
+// все активные игроки что-то отправили (слово или потраченную попытку)?
+function allSubmitted(room) {
+  return activeIds(room).every((id) => room.round.submissions[id] !== undefined);
+}
+
+function resolveTick(room) {
+  const r = room.round;
+  clearPhaseTimer(room);
+
+  // оценка отправленных слов и дополнение локальных досок
+  for (const [id, sub] of Object.entries(r.submissions)) {
+    if (sub.w == null) continue; // попытка потрачена на способность
+    const marks = evaluateGuess(sub.w, r.word);
+    r.boards[id].push({ w: sub.w, marks });
+    const p = room.players.get(id);
+    if (p) {
+      if (!p.stats) p.stats = emptyStats();
+      p.stats.absentTiles += marks.filter((m) => m === 'absent').length;
+    }
+    if (sub.w === r.word) {
+      r.winners.push(id);
+      r.done[id] = 'guessed';
+    }
+  }
+
+  // деревенская кража: полный рестарт раунда посреди игры
+  if (r.pendingSteal) {
+    const thief = room.players.get(r.stealBy);
+    if (r.winners.length > 0) {
+      // кто-то успел угадать — сброс не срабатывает, талон возвращается
+      if (thief) addToken(thief, POWER_COST.steal);
+      sendToPlayer(room, r.stealBy, 'Кто-то угадал раньше — кража не удалась, талон вернули 🐄');
+      r.pendingSteal = false;
+      r.stealBy = null;
+    } else {
+      // слово меняется на месте: ряды остаются, помечаются старыми
+      r.word = pickWord(r.lang, room.settings.wordLength);
+      for (const board of Object.values(r.boards)) {
+        for (const row of board) row.old = true;
+      }
+      r.log.push({ tick: r.tick, type: 'stealDone', by: r.stealBy });
+      r.pendingSteal = false;
+      r.stealBy = null;
+    }
+  }
+
+  for (const p of connectedPlayers(room)) sendMyRows(room, p.id);
+
+  if (r.winners.length > 0) {
+    // очки делятся между угадавшими один тик (с учетом события «Золотой надой»)
+    const mult = r.event?.id === 'double' ? 2 : 1;
+    const share = Math.round(((tickValue(r.tick) * mult) / r.winners.length) * 100) / 100;
+    for (const id of r.winners) {
+      const p = room.players.get(id);
+      if (p) {
+        p.points = Math.round((p.points + share) * 100) / 100;
+        if (!p.stats) p.stats = emptyStats();
+        if (r.tick <= 2) p.stats.fastWins += 1;
+        if (!r.tokensSpent?.[id]) p.stats.noTokenWins += 1;
+      }
+    }
+    r.tickShare = share;
+    // талоны не-победителям (гибрид)
+    for (const other of connectedPlayers(room)) {
+      if (!r.winners.includes(other.id)) addToken(other, 1);
+    }
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'win', winners: [...r.winners], pts: share, tick: r.tick };
+    r.log.push({ tick: r.tick, type: 'win', winners: [...r.winners], pts: share });
+    room.phase = 'roundEnd';
+    room.readySet = new Set();
+    autoReadyBots(room);
+    room.roundEndTimer = setTimeout(() => {
+      if (room.phase === 'roundEnd') nextRound(room);
+    }, ROUND_END_DELAY);
+    broadcast(room);
+    return;
+  }
+
+  const connected = connectedPlayers(room);
+  // раунд заканчивается ТОЛЬКО по лимиту тиков (угадавшие закрывают раунд раньше,
+  // через ветку winners выше) — заполнение доски рядами на это не влияет
+  if (r.tick >= MAX_ROUND_TICKS) {
+    for (const p of connected) addToken(p, 1); // раунд без победителя — всем по талону
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'noWinner', word: r.word };
+    room.phase = 'roundEnd';
+    room.readySet = new Set();
+    autoReadyBots(room);
+    room.roundEndTimer = setTimeout(() => {
+      if (room.phase === 'roundEnd') nextRound(room);
+    }, ROUND_END_DELAY);
+    broadcast(room);
+    return;
+  }
+
+  // иначе — фаза обдумывания: следующий тик после «Готов» от всех
+  room.phase = 'tickEnd';
+  room.readySet = new Set();
+  autoReadyBots(room);
+  schedulePhase(room, TICK_END_FALLBACK, () => {
+    if (room.phase === 'tickEnd') nextTick(room);
+  });
+  broadcast(room);
+}
+
+// следующий тик после обдумывания
+function nextTick(room) {
+  clearPhaseTimer(room);
+  if (room.phase !== 'tickEnd' || !room.round) return;
+  room.round.tick += 1;
+  room.round.submissions = {};
+  room.phase = 'round';
+  startTickTimer(room);
+  broadcast(room);
+}
+
+function nextRound(room) {
+  clearTimeout(room.roundEndTimer);
+  room.roundEndTimer = null;
+  const champion = [...room.players.values()].find(
+    (p) => p.points >= room.settings.pointsToWin,
+  );
+  if (champion) {
+    room.championId = champion.id;
+    room.phase = 'matchEnd';
+    broadcast(room);
+    return;
+  }
+  startRound(room);
+}
+
+// «Готов» в обдумывании и интерлюдии: когда нажали все подключенные
+function handleReady(room, ws) {
+  if (room.phase !== 'tickEnd' && room.phase !== 'roundEnd') return;
+  const p = room.players.get(ws.playerId);
+  if (!p) return;
+  room.readySet.add(p.id);
+  autoReadyBots(room);
+  const alive = connectedPlayers(room).map((x) => x.id);
+  if (alive.every((id) => room.readySet.has(id))) {
+    clearTimeout(room.roundEndTimer);
+    room.roundEndTimer = null;
+    if (room.phase === 'tickEnd') nextTick(room);
+    else nextRound(room);
+  } else {
+    broadcast(room);
+  }
+}
+
+// ---------- попытки и способности ----------
+function handleGuess(room, ws, msg) {
+  if (room.phase !== 'round') return;
+  const p = roundPlayer(room, ws.playerId);
+  if (!p) {
+    sendTo(ws, 'Ты наблюдатель — вступишь со следующего слова');
+    return;
+  }
+  const r = room.round;
+  if (r.submissions[ws.playerId] !== undefined) {
+    sendTo(ws, 'В этом тике ты уже отправил слово');
+    return;
+  }
+  const lang = r.lang;
+  const word = normalizeWord(msg.word, lang, r.word.length);
+  if (word.length !== r.word.length || !isValidWord(word, lang, r.word.length)) {
+    sendTo(ws, lang === 'en' ? 'Not in my word list' : 'Такого слова нет в моем словаре');
+    return;
+  }
+  r.submissions[ws.playerId] = { w: word };
+  // тик закрывается, когда все отправили (победители определятся на закрытии)
+  if (allSubmitted(room)) resolveTick(room);
+  else broadcast(room);
+}
+
+function spendToken(p, kind, round) {
+  if (p.tokens < POWER_COST[kind]) {
     return false;
   }
-  p.tokens -= TOKEN_COST[kind];
+  p.tokens -= POWER_COST[kind];
+  if (round) {
+    round.tokensSpent[p.id] = (round.tokensSpent[p.id] || 0) + POWER_COST[kind];
+  }
+  if (!p.stats) p.stats = emptyStats();
+  if (kind === 'intercept' || kind === 'steal') {
+    p.stats.dirtyPowers += 1;
+  } else {
+    p.stats.spyPowers += 1;
+  }
   return true;
 }
 
-function handleGuess(ws, msg) {
+function handlePower(room, ws, msg) {
   if (room.phase !== 'round') return;
+  const kind = msg.kind;
+  if (!POWER_COST[kind]) return;
   const r = room.round;
-  const p = room.players.get(ws.playerId);
-  if (!p) return;
-
-  if (!r.order.includes(ws.playerId)) {
-    sendTo(ws, 'Ты вступишь с нового розыгрыша, новичок');
-    return;
-  }
-  if (r.order[r.turnIdx] !== ws.playerId) {
-    sendTo(ws, 'Не твоя попытка, жадина');
-    return;
-  }
-  const word = normalizeWord(msg.word);
-  if (word.length !== 5 || !isValidWord(word)) {
-    sendTo(ws, 'Такого слова нет в моем словаре');
+  const p = roundPlayer(room, ws.playerId);
+  if (!p) {
+    sendTo(ws, 'Наблюдатели без способностей 😏');
     return;
   }
 
-  const marks = evaluateGuess(word, r.word);
-  r.board.push({ w: word, marks, byId: p.id, byName: p.name });
-
-  if (word === r.word) {
-    r.winnerId = p.id;
-    p.points += 1;
-    if (room.settings.teamMode && p.team) room.teamPoints[p.team] += 1;
-    room.phase = 'roundEnd';
-    clearPhaseTimer(); // таймер хода больше не тикает — ждем «Готов»
-    // карьера: серия побед
-    const cw = careerOf(p);
-    cw.wins += 1;
-    cw.winStreak += 1;
-    cw.bestStreak = Math.max(cw.bestStreak, cw.winStreak);
-    if (cw.winStreak >= 5) grantAchievement(p, 'stakhanovets');
-    for (const other of room.players.values()) {
-      if (other.id !== p.id) careerOf(other).winStreak = 0;
-    }
-    saveCareer();
-    // жетоны неугадавшим (гибрид): победителю — нет, остальным — по жетону
-    for (const other of room.players.values()) {
-      if (other.id !== p.id) addToken(other);
-    }
-    room.readySet = new Set();
-    // запасной таймер: если кто-то ушел в закат, раунд продолжится сам
-    room.roundEndTimer = setTimeout(() => {
-      if (room.phase === 'roundEnd') nextRound();
-    }, ROUND_END_DELAY);
-  } else {
-    advanceTurn();
-  }
-}
-
-// «Готов» в интерлюдии: когда нажали все игроки текущего раунда — следующий.
-// Наблюдатели (вступают после этого слова) в готов не играют.
-function handleReady(ws) {
-  if (room.phase !== 'roundEnd') return;
-  const p = room.players.get(ws.playerId);
-  if (!p || !room.round?.order.includes(p.id)) return;
-  room.readySet.add(p.id);
-  const rotation = connectedPlayers().filter((x) => room.round.order.includes(x.id));
-  if (rotation.every((x) => room.readySet.has(x.id))) {
-    clearTimeout(room.roundEndTimer);
-    room.roundEndTimer = null;
-    nextRound();
-  } else {
-    broadcast();
-  }
-}
-
-function handlePower(ws, msg) {
-  const p = room.players.get(ws.playerId);
-  if (!p) return;
-
-  // 🤫 Проверка буквы: жетон, но ход не тратим и доступна в любой момент раунда
-  if (msg.kind === 'check') {
-    if (room.phase !== 'round') {
-      sendTo(ws, 'Проверка работает только во время раунда');
+  // --- способности, НЕ тратящие попытку (нельзя только угадавшим) ---
+  if (kind === 'cream' || kind === 'sniper') {
+    if (r.done[ws.playerId]) {
+      sendTo(ws, 'Ты уже угадал — отдыхай 😏');
       return;
     }
-    const letter = normalizeWord(msg.letter);
+    const letter = normalizeWord(msg.letter, r.lang);
     if (letter.length !== 1) return;
-    if (!spendToken(p, 'check', ws)) return;
-    const hints = room.hints.get(p.id) || [];
-    hints.push({ letter, inWord: room.round.word.includes(letter) });
-    room.hints.set(p.id, hints);
-    sendPrivate(ws, { hints });
-    broadcast();
-    return;
-  }
-
-  // остальные усиления тратят ход
-  if (room.phase !== 'round') return;
-  const r = room.round;
-  if (r.order[r.turnIdx] !== ws.playerId) {
-    sendTo(ws, 'Усиления — вместо твоей попытки. Сейчас не твой ход');
-    return;
-  }
-  if (!spendToken(p, msg.kind, ws)) return;
-
-  if (msg.kind === 'reveal') {
-    const pos = Math.min(4, Math.max(0, Number(msg.pos) || 0));
-    room.reveals.push({ pos, letter: r.word[pos], by: p.name });
-    advanceTurn();
-  } else if (msg.kind === 'swap') {
-    for (const row of r.board) row.old = true;
-    room.reveals = [];
-    room.hints.clear();
-    room.whispers.clear();
-    room.swapCount += 1;
-    let fresh = pickWord(room.settings.theme);
-    while (fresh === r.word) fresh = pickWord(room.settings.theme);
-    r.word = fresh;
-    advanceTurn();
-  } else if (msg.kind === 'freeze') {
-    // заморозить можно любого игрока в очереди (кроме себя)
-    let target = typeof msg.target === 'string' ? msg.target : null;
-    const valid =
-      target &&
-      target !== p.id &&
-      r.order.includes(target) &&
-      room.players.get(target)?.connected;
-    if (!valid) {
-      // цель не указана или невалидна — замораживаем следующего по очереди
-      const nextIdx = (r.turnIdx + 1) % r.order.length;
-      target = r.order[nextIdx];
+    if (!spendToken(p, kind, r)) return;
+    const hints = room.privateHints.get(ws.playerId) || [];
+    if (kind === 'cream') {
+      hints.push({ letter, inWord: r.word.includes(letter) });
+      room.lastEvent = { seq: room.eventSeq + 1, type: 'cream', by: ws.playerId };
+      r.log.push({ tick: r.tick, type: 'cream', by: ws.playerId });
+    } else {
+      const pos = Math.min(r.word.length - 1, Math.max(0, Number(msg.pos) || 0));
+      hints.push({ type: 'pos', letter, pos, atPos: r.word[pos] === letter });
+      room.lastEvent = { seq: room.eventSeq + 1, type: 'sniper', by: ws.playerId };
+      r.log.push({ tick: r.tick, type: 'sniper', by: ws.playerId });
     }
-    room.frozenId = target;
-    room.frozenHistory.push({ by: p.id, target });
-    advanceTurn();
-  } else if (msg.kind === 'whisper') {
-    const exclude = new Set(r.board.filter((row) => !row.old).map((row) => row.w));
-    const candidates = consistentWords(
-      r.board.filter((row) => !row.old),
-      room.reveals,
-      exclude,
-    );
-    const picked = [];
-    while (picked.length < 3 && candidates.length > 0) {
-      picked.push(...candidates.splice(Math.floor(Math.random() * candidates.length), 1));
-    }
-    room.whispers.set(p.id, picked);
-    sendPrivate(ws, { whispers: picked });
-    advanceTurn();
-  }
-  broadcast();
-}
-
-// ---------- розыгрыш и выбор позиций ----------
-function handleDrawPick(ws, msg) {
-  if (room.phase !== 'draw') return;
-  const p = room.players.get(ws.playerId);
-  if (!p || !p.connected) return;
-  if (msg.side !== 'egg' && msg.side !== 'hen') return;
-  room.draw.votes[p.id] = msg.side;
-  if (connectedPlayers().every((x) => room.draw.votes[x.id])) resolveDraw();
-  broadcast();
-}
-
-function handleSmkPick(ws, msg) {
-  if (room.phase !== 'smk') return;
-  const p = room.players.get(ws.playerId);
-  if (!p || !room.smk.pairs.flat().includes(p.id)) return;
-  if (!SMK_BEATS[msg.sym]) return;
-  room.smk.picks[p.id] = msg.sym;
-  if (room.smk.pairs.flat().every((id) => room.smk.picks[id])) resolveSmkRound();
-  broadcast();
-}
-
-function handlePickPos(ws, msg) {
-  if (room.phase !== 'pickpos') return;
-  const p = room.players.get(ws.playerId);
-  if (!p || room.pickQueue[0] !== p.id) return;
-  const pos = Number(msg.pos);
-  const taken = new Set(Object.values(room.assigned || {}));
-  const maxPos = Object.keys(room.draw?.votes || {}).length || room.players.size;
-  if (!Number.isInteger(pos) || pos < 0 || pos >= maxPos || taken.has(pos)) {
-    sendTo(ws, 'Эта позиция уже занята');
+    room.privateHints.set(ws.playerId, hints);
+    sendMyRows(room, ws.playerId);
+    broadcast(room);
     return;
   }
-  room.assigned[p.id] = pos;
-  room.pickQueue.shift();
 
-  if (room.pickQueue.length === 0) {
-    if (room.smk && room.smk.pending) {
-      startSmk(room.smk.pool); // меньшинство выбрало — теперь СМК за остальные места
+  // --- прошлые надои: подсмотреть написанные слова цели, порядок перемешан ---
+  if (kind === 'peek') {
+    if (r.done[ws.playerId]) {
+      sendTo(ws, 'Ты уже угадал — отдыхай 😏');
       return;
     }
-    finishDraw();
+    const candidates = Object.keys(r.boards).filter(
+      (id) => id !== ws.playerId && (r.boards[id]?.length ?? 0) > 0,
+    );
+    if (candidates.length === 0) {
+      sendTo(ws, 'Никто еще ничего не наливал — смотреть нечего');
+      return;
+    }
+    const target = candidates.includes(msg.target)
+      ? msg.target
+      : candidates[Math.floor(Math.random() * candidates.length)];
+    if (!spendToken(p, kind, r)) return;
+    const words = r.boards[target].map((row) => row.w);
+    // перемешиваем: сопоставлять с плитками придется самому
+    for (let i = words.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [words[i], words[j]] = [words[j], words[i]];
+    }
+    sendPrivate(ws, { peek: { target, words } });
+    sendTo(ws, `🕵️ Подсмотрел прошлые надои ${room.players.get(target)?.name ?? 'кого-то'} — но порядок перемешан!`);
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'peek', by: ws.playerId };
+    r.log.push({ tick: r.tick, type: 'peek', by: ws.playerId, target });
+    broadcast(room); // талоны обновились у всех
     return;
   }
-  schedulePickTimer(); // у следующего игрока свои PICK_SECONDS
-  broadcast();
+
+  // --- способности ЗА попытку: только если еще не отправил в этом тике ---
+  if (r.submissions[ws.playerId] !== undefined) {
+    sendTo(ws, 'Ты уже отправил слово в этом тике');
+    return;
+  }
+  if (!spendToken(p, kind, r)) return;
+
+  if (kind === 'recon') {
+    // сексуальная разведка: 2 случайных слова на свою доску (доска не ограничена)
+    for (let i = 0; i < 2; i++) {
+      const w = randomWord(r.lang, r.word.length);
+      const marks = evaluateGuess(w, r.word);
+      r.boards[ws.playerId].push({ w, marks });
+      if (w === r.word) {
+        r.winners.push(ws.playerId); // разведка может случайно угадать!
+        r.done[ws.playerId] = 'guessed';
+      }
+    }
+    r.submissions[ws.playerId] = { w: null };
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'recon', by: ws.playerId };
+    r.log.push({ tick: r.tick, type: 'recon', by: ws.playerId });
+    sendMyRows(room, ws.playerId);
+  } else if (kind === 'intercept') {
+    // белковый перехват: подменяем слово цели в этом тике
+    const target = roundPlayer(room, msg.target);
+    if (!target || target.id === ws.playerId) {
+      p.tokens += POWER_COST[kind]; // возврат
+      p.stats.dirtyPowers = Math.max(0, (p.stats.dirtyPowers || 1) - 1);
+      sendTo(ws, 'Цель недоступна — талон вернули');
+      broadcast(room);
+      return;
+    }
+    const w = randomWord(r.lang, r.word.length);
+    if (r.submissions[target.id] !== undefined && r.submissions[target.id].w != null) {
+      r.submissions[target.id] = { w }; // подмена уже написанного
+    } else if (r.submissions[target.id] === undefined) {
+      r.submissions[target.id] = { w }; // лочим случайное за цель
+    }
+    sendToPlayer(room, target.id, `🐄 ${p.name} перехватил твою попытку — отправлено случайное слово!`);
+    r.submissions[ws.playerId] = { w: null };
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'intercept', by: ws.playerId, target: target.id };
+    r.log.push({ tick: r.tick, type: 'intercept', by: ws.playerId, target: target.id });
+  } else if (kind === 'steal') {
+    // деревенская кража: раунд перезапустится в конце тика (см. resolveTick)
+    r.pendingSteal = true;
+    r.stealBy = ws.playerId;
+    r.submissions[ws.playerId] = { w: null };
+    room.lastEvent = { seq: room.eventSeq + 1, type: 'steal', by: ws.playerId };
+    r.log.push({ tick: r.tick, type: 'steal', by: ws.playerId });
+  }
+
+  if (allSubmitted(room)) resolveTick(room);
+  else broadcast(room);
 }
 
-function migrateHost() {
-  if (room.hostId && room.players.get(room.hostId)?.connected) return;
-  room.hostId = connectedPlayers()[0]?.id ?? null;
+function migrateHost(room) {
+  const currentHost = room.hostId ? room.players.get(room.hostId) : null;
+  if (currentHost && currentHost.connected && !currentHost.isBot) return;
+  room.hostId = humanPlayers(room)[0]?.id ?? null;
 }
 
-// все разом ушли — комната на ноль, сброс
-function resetIfEmpty() {
-  if (connectedPlayers().length > 0) return false;
+// хост завершает матч: все возвращаются в лобби с чистого листа
+function endMatch(room) {
+  clearPhaseTimer(room);
   clearTimeout(room.roundEndTimer);
   room.roundEndTimer = null;
-  clearPhaseTimer();
   room.phase = 'lobby';
   room.round = null;
-  room.order = null;
-  room.blockStart = null;
-  room.draw = null;
-  room.smk = null;
-  room.pickQueue = null;
-  room.assigned = null;
-  room.reveals = [];
-  room.frozenId = null;
-  room.hints.clear();
-  room.whispers.clear();
+  room.privateHints.clear();
   room.championId = null;
-  room.championTeam = null;
-  room.teamPoints = { egg: 0, hen: 0 };
-  room.teams = null;
-  room.frozenHistory = [];
+  for (const p of room.players.values()) {
+    p.points = 0;
+    p.stats = emptyStats();
+  }
+}
+
+function resetIfEmpty(room) {
+  if (humanPlayers(room).length > 0) return false;
+  clearPhaseTimer(room);
+  clearTimeout(room.roundEndTimer);
+  room.roundEndTimer = null;
+  room.phase = 'lobby';
+  room.round = null;
+  room.championId = null;
+  // комната дышит еще минуту: вдруг кто-то обновит страницу и вернется.
+  // вешаем на deleteTimer — hello при переподключении его снимает
+  clearTimeout(room.deleteTimer);
+  room.deleteTimer = setTimeout(() => {
+    if (humanPlayers(room).length === 0) {
+      rooms.delete(room.id);
+      broadcastRoomList();
+    }
+  }, 60000);
   for (const p of room.players.values()) {
     p.points = 0;
     p.tokens = 0;
-    p.team = null;
   }
   return true;
 }
 
-// кто-то отвалился посреди розыгрыша — разаем места сами
-function abortDraw() {
-  room.order = connectedPlayers().map((p) => p.id);
-  room.blockStart = roundCounter + 1;
-  room.draw = null;
-  room.smk = null;
-  room.pickQueue = null;
-  room.assigned = null;
-  for (const client of wss.clients) {
-    if (client.readyState === 1) client.send(JSON.stringify({ t: 'toast', text: 'Зорька раздала места сама — кто-то сбежал' }));
+// игрок покинул комнату (вернулся в меню) — запись удаляется
+function leaveRoom(ws) {
+  const room = roomOf(ws);
+  if (!room) return;
+  const p = room.players.get(ws.playerId);
+  if (p) room.players.delete(ws.playerId);
+  if (room.phase === 'round' && room.round?.submissions[ws.playerId] !== undefined) {
+    delete room.round.submissions[ws.playerId];
+    if (allSubmitted(room)) resolveTick(room);
   }
-  newRound();
+  if (room.phase === 'tickEnd' || room.phase === 'roundEnd') {
+    autoReadyBots(room);
+    const alive = connectedPlayers(room).map((x) => x.id);
+    if (alive.length > 0 && alive.every((id) => room.readySet.has(id))) {
+      clearTimeout(room.roundEndTimer);
+      room.roundEndTimer = null;
+      if (room.phase === 'tickEnd') nextTick(room);
+      else nextRound(room);
+    }
+  }
+  migrateHost(room);
+  ws.roomId = null;
+  resetIfEmpty(room);
+  broadcastRoomList();
+  broadcast(room);
 }
 
 // ---------- WebSocket ----------
@@ -896,6 +958,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
   ws.playerId = null;
+  ws.roomId = null;
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -913,101 +976,287 @@ wss.on('connection', (ws) => {
       case 'hello': {
         if (!msg.id) return;
         ws.playerId = msg.id;
-        let p = room.players.get(msg.id);
+        // автопереподключение: если игрок уже был в комнате — возвращаем
+        let rejoined = null;
+        for (const room of rooms.values()) {
+          const p = room.players.get(msg.id);
+          if (p) {
+            p.connected = true;
+            p.name = String(msg.name || p.name).slice(0, 24);
+            p.avatar = msg.avatar || p.avatar;
+            rejoined = room;
+            break;
+          }
+        }
+        if (rejoined) {
+          clearTimeout(rejoined.deleteTimer);
+          rejoined.deleteTimer = null;
+          ws.roomId = rejoined.id;
+          migrateHost(rejoined);
+        }
+        // тестовый грант: полный кошелек сразу (для автотестов способностей)
+        if (process.env.TEST_TOKEN_GRANT && rejoined) {
+          const p = rejoined.players.get(msg.id);
+          if (p) {
+            p.tokens = TOKEN_CAP;
+            p.testGrant = true;
+          }
+        }
+        sendPrivate(ws, { rejoined: rejoined ? rejoined.id : null });
+        ws.send(JSON.stringify({ t: 'roomList', rooms: serializeRoomList() }));
+        if (rejoined) {
+          broadcast(rejoined);
+          if (rejoined.round) sendMyRows(rejoined, msg.id);
+        }
+        break;
+      }
+
+      case 'roomList': {
+        ws.send(JSON.stringify({ t: 'roomList', rooms: serializeRoomList() }));
+        break;
+      }
+
+      case 'createRoom': {
+        if (ws.roomId) break; // уже в комнате
+        const room = newRoom(String(msg.name || '').slice(0, 30), msg.visibility, msg.isPrivate);
+        ws.roomId = room.id;
+        const pid = ws.playerId;
+        room.players.set(pid, {
+          id: pid,
+          name: String(msg.playerName || 'Гость').slice(0, 24),
+          avatar: msg.avatar || null,
+          points: 0,
+          tokens: process.env.TEST_TOKEN_GRANT ? TOKEN_CAP : TOKEN_START,
+          order: ++joinCounter,
+          connected: true,
+          isBot: false,
+          stats: emptyStats(),
+          testGrant: Boolean(process.env.TEST_TOKEN_GRANT),
+        });
+        room.hostId = pid;
+        broadcastRoomList();
+        broadcast(room);
+        break;
+      }
+
+      case 'joinRoom': {
+        if (ws.roomId) break;
+        const room = rooms.get(String(msg.roomId || '').trim().toUpperCase());
+        if (!room) {
+          sendTo(ws, 'Комната не найдена 🐮');
+          break;
+        }
+        if (connectedPlayers(room).length >= MAX_PLAYERS) {
+          sendTo(ws, 'В комнате уже восемь дояров — тесно!');
+          break;
+        }
+        ws.roomId = room.id;
+        const pid = ws.playerId;
+        let p = room.players.get(pid);
         if (!p) {
           p = {
-            id: msg.id,
-            name: String(msg.name || 'Гость').slice(0, 24),
+            id: pid,
+            name: String(msg.playerName || 'Гость').slice(0, 24),
             avatar: msg.avatar || null,
             points: 0,
-            tokens: 0,
+            tokens: process.env.TEST_TOKEN_GRANT ? TOKEN_CAP : TOKEN_START,
             order: ++joinCounter,
             connected: true,
+            isBot: false,
+            stats: emptyStats(),
+            testGrant: Boolean(process.env.TEST_TOKEN_GRANT),
           };
-          room.players.set(msg.id, p);
+          room.players.set(pid, p);
         } else {
           p.connected = true;
-          p.name = String(msg.name || p.name).slice(0, 24);
-          p.avatar = msg.avatar || p.avatar;
         }
-        migrateHost();
-        broadcast();
+        migrateHost(room);
+        broadcastRoomList();
+        broadcast(room);
+        break;
+      }
+
+      case 'addBot': {
+        const room = roomOf(ws);
+        if (!room || room.phase !== 'lobby' || ws.playerId !== room.hostId) break;
+        if (connectedPlayers(room).length >= MAX_PLAYERS) {
+          sendTo(ws, 'В хлеву максимум 8 мест!');
+          break;
+        }
+        const existingNames = new Set([...room.players.values()].map((p) => p.name));
+        const name = BOT_NAMES.find((n) => !existingNames.has(n)) || `🤖 Бот #${room.players.size + 1}`;
+        const botId = `bot-${ ++joinCounter }-${Math.random().toString(36).slice(2, 6)}`;
+        const diff = ['easy', 'normal', 'hard'].includes(msg.difficulty) ? msg.difficulty : 'normal';
+        room.players.set(botId, {
+          id: botId,
+          name,
+          avatar: null,
+          points: 0,
+          tokens: TOKEN_START,
+          order: joinCounter,
+          connected: true,
+          isBot: true,
+          difficulty: diff,
+          stats: emptyStats(),
+          testGrant: false,
+        });
+        broadcastRoomList();
+        broadcast(room);
+        break;
+      }
+
+      case 'setBotDifficulty': {
+        const room = roomOf(ws);
+        if (!room || room.phase !== 'lobby' || ws.playerId !== room.hostId) break;
+        const target = room.players.get(msg.botId);
+        if (target && target.isBot && ['easy', 'normal', 'hard'].includes(msg.difficulty)) {
+          target.difficulty = msg.difficulty;
+          broadcast(room);
+        }
+        break;
+      }
+
+      case 'removeBot': {
+        const room = roomOf(ws);
+        if (!room || room.phase !== 'lobby' || ws.playerId !== room.hostId) break;
+        const target = room.players.get(msg.botId);
+        if (target && target.isBot) {
+          room.players.delete(msg.botId);
+          broadcastRoomList();
+          broadcast(room);
+        }
+        break;
+      }
+
+      case 'leaveRoom': {
+        leaveRoom(ws);
+        break;
+      }
+
+      case 'deleteRoom': {
+        const room = roomOf(ws);
+        if (!room) break;
+        if (ws.playerId !== room.hostId) {
+          sendTo(ws, 'Удалить комнату может только хост 🐄');
+          break;
+        }
+        // распускаем: всем игрокам назад в меню
+        clearPhaseTimer(room);
+        clearTimeout(room.roundEndTimer);
+        clearTimeout(room.deleteTimer);
+        rooms.delete(room.id);
+        for (const client of wss.clients) {
+          if (client.readyState !== 1 || client.roomId !== room.id) continue;
+          client.roomId = null;
+          client.send(JSON.stringify({ t: 'toast', text: 'Хост распустил комнату 🐄' }));
+          // пустое состояние возвращает клиент в меню
+          client.send(JSON.stringify({ t: 'state', state: { phase: 'lobby', roomId: null, settings: {}, players: [], round: null } }));
+        }
+        broadcastRoomList();
         break;
       }
 
       case 'settings': {
-        if (
-          ws.playerId === room.hostId &&
-          room.phase === 'lobby'
-        ) {
+        const room = roomOf(ws);
+        if (room && ws.playerId === room.hostId && room.phase === 'lobby') {
           let changed = false;
-          if ([1, 3, 5, 10].includes(msg.pointsToWin) && msg.pointsToWin !== room.settings.pointsToWin) {
+          if (POINT_OPTIONS.includes(msg.pointsToWin) && msg.pointsToWin !== room.settings.pointsToWin) {
             room.settings.pointsToWin = msg.pointsToWin;
             changed = true;
           }
-          if (['all', 'food', 'animals', 'home'].includes(msg.theme) && msg.theme !== room.settings.theme) {
-            room.settings.theme = msg.theme;
+          if (LANGS.has(msg.lang) && msg.lang !== room.settings.lang) {
+            room.settings.lang = msg.lang;
             changed = true;
           }
-          if (typeof msg.teamMode === 'boolean' && msg.teamMode !== room.settings.teamMode) {
-            room.settings.teamMode = msg.teamMode;
+          if (WORD_LENS.has(msg.wordLength) && msg.wordLength !== room.settings.wordLength) {
+            room.settings.wordLength = msg.wordLength;
             changed = true;
           }
-          if (changed) broadcast();
+          if ((msg.visibility === 'open' || msg.visibility === 'closed') && msg.visibility !== room.settings.visibility) {
+            room.settings.visibility = msg.visibility;
+            changed = true;
+          }
+          if (TICK_OPTIONS.includes(msg.tickSeconds) && msg.tickSeconds !== room.settings.tickSeconds) {
+            room.settings.tickSeconds = msg.tickSeconds;
+            changed = true;
+          }
+          if (typeof msg.eventsEnabled === 'boolean' && msg.eventsEnabled !== room.settings.eventsEnabled) {
+            room.settings.eventsEnabled = msg.eventsEnabled;
+            changed = true;
+          }
+          if (changed) {
+            broadcastRoomList();
+            broadcast(room);
+          }
         }
         break;
       }
 
       case 'start': {
-        // запустить может любой участник — хост нужен только для настроек лобби
-        if (room.phase === 'lobby' && connectedPlayers().length >= 1) startMatch();
+        const room = roomOf(ws);
+        if (!room || room.phase !== 'lobby' || connectedPlayers(room).length < 1) break;
+        if (ws.playerId !== room.hostId) {
+          sendTo(ws, 'Начать матч может только хост 🐄');
+          break;
+        }
+        startMatch(room);
+        break;
+      }
+
+      case 'rematch': {
+        const room = roomOf(ws);
+        if (!room || room.phase !== 'matchEnd') break;
+        if (ws.playerId !== room.hostId) {
+          sendTo(ws, 'Реванш объявляет только хост 🐄');
+          break;
+        }
+        endMatch(room);
+        startMatch(room);
         break;
       }
 
       case 'guess':
-        handleGuess(ws, msg);
-        broadcast();
-        break;
-
-      case 'power':
-        handlePower(ws, msg);
-        broadcast();
-        break;
-
-      case 'drawPick':
-        handleDrawPick(ws, msg);
-        break;
-
-      case 'smkPick':
-        handleSmkPick(ws, msg);
-        break;
-
-      case 'pickPos':
-        handlePickPos(ws, msg);
-        break;
-
-      case 'next': {
-        if (room.phase === 'roundEnd') nextRound();
+      case 'power': {
+        const room = roomOf(ws);
+        if (!room) break;
+        if (msg.t === 'guess') handleGuess(room, ws, msg);
+        else handlePower(room, ws, msg);
         break;
       }
 
-      case 'ready':
-        handleReady(ws);
-        broadcast();
+      case 'ready': {
+        const room = roomOf(ws);
+        if (room) handleReady(room, ws);
         break;
+      }
 
-      case 'rematch': {
-        if (room.phase === 'matchEnd') startMatch();
+      case 'endMatch': {
+        const room = roomOf(ws);
+        if (
+          room &&
+          ws.playerId === room.hostId &&
+          ['round', 'roundEnd', 'matchEnd'].includes(room.phase)
+        ) {
+          endMatch(room);
+          broadcast(room);
+          for (const client of wss.clients) {
+            if (client.readyState === 1 && client.roomId === room.id) {
+              client.send(JSON.stringify({ t: 'toast', text: 'Хост завершил матч — все в лобби 🐮' }));
+            }
+          }
+        }
         break;
       }
 
       case 'react': {
+        const room = roomOf(ws);
+        if (!room) break;
         const emoji = String(msg.emoji || '');
         if (!REACTIONS.has(emoji)) return;
         const from = room.players.get(ws.playerId)?.name;
         const out = JSON.stringify({ t: 'react', emoji, from });
         for (const client of wss.clients) {
-          if (client.readyState === 1) client.send(out);
+          if (client.readyState === 1 && client.roomId === room.id) client.send(out);
         }
         break;
       }
@@ -1018,26 +1267,30 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    const room = roomOf(ws);
+    if (!room) return;
     const p = room.players.get(ws.playerId);
     if (p) p.connected = false;
-    if (room.phase === 'round' && room.round?.order[room.round.turnIdx] === ws.playerId) {
-      advanceTurn();
-    }
-    if (['draw', 'smk', 'pickpos'].includes(room.phase) && connectedPlayers().length > 0) {
-      abortDraw();
-    }
     // ушедший мог быть последним неготовым — проверяем готов-флоу заново
-    if (room.phase === 'roundEnd') {
-      const rotation = connectedPlayers().filter((x) => room.round?.order.includes(x.id));
-      if (rotation.length > 0 && rotation.every((x) => room.readySet.has(x.id))) {
+    if (room.phase === 'tickEnd' || room.phase === 'roundEnd') {
+      autoReadyBots(room);
+      const alive = connectedPlayers(room).map((x) => x.id);
+      if (alive.length > 0 && alive.every((id) => room.readySet.has(id))) {
         clearTimeout(room.roundEndTimer);
         room.roundEndTimer = null;
-        nextRound();
+        if (room.phase === 'tickEnd') nextTick(room);
+        else nextRound(room);
       }
     }
-    migrateHost();
-    resetIfEmpty();
-    broadcast();
+    if (room.phase === 'round' && room.round?.submissions[ws.playerId] !== undefined) {
+      delete room.round.submissions[ws.playerId];
+      if (allSubmitted(room)) resolveTick(room);
+    }
+    migrateHost(room);
+    broadcast(room);
+    // последний ушел — комната дышит еще минуту на случай переподключения
+    resetIfEmpty(room);
+    broadcastRoomList();
   });
 });
 
@@ -1053,6 +1306,6 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`🥛 Сервер МОЛОКО на порту ${PORT}`);
+  console.log(`🥛 Сервер МОЛОКО 2.0 на порту ${PORT} — комнат: ${rooms.size}`);
   if (process.env.DEBUG_WORD) console.log(`-debug: слово раунда: ${process.env.DEBUG_WORD}`);
 });

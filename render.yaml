@@ -1,15 +1,15 @@
-# Blueprint для Render.com: New + -> Blueprint -> выбери репозиторий,
-# он подхватит этот файл. Секреты (CLIENT_SECRET) задаются в дашборде.
 services:
   - type: web
-    name: moloko-wordly
+    name: wordly-moloko
     runtime: node
     plan: free
-    NODE_VERSION: '22'
     buildCommand: npm install && npm run build
     startCommand: npm start
+    healthCheckPath: /api/ping
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: VITE_CLIENT_ID
-        sync: false # Application ID из Discord Developer Portal
+        sync: false
       - key: CLIENT_SECRET
-        sync: false # Client Secret — никому не показывай
+        sync: false

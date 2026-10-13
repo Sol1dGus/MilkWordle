@@ -11,7 +11,10 @@
     "start": "node --env-file-if-exists=.env server/index.js",
     "test:server": "node scripts/test-server.mjs",
     "check:words": "node scripts/check-words.mjs",
-    "build:dicts": "node scripts/build-dicts.mjs"
+    "build:dicts": "node scripts/build-dicts.mjs",
+    "build:dicts-en": "node scripts/build-dicts-en.mjs",
+    "build:dicts-ru": "node scripts/build-dicts-ru.mjs",
+    "build:dicts-en67": "node scripts/build-dicts-en67.mjs"
   },
   "dependencies": {
     "@discord/embedded-app-sdk": "^1.2.1",
